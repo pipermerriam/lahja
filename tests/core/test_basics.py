@@ -132,8 +132,8 @@ async def test_stream_can_get_cancelled(endpoint: Endpoint) -> None:
             if stream_counter == 2:
                 await async_generator.aclose()
 
-    asyncio.ensure_future(stream_response())
-    asyncio.ensure_future(cancel_soon())
+    stream_coro = asyncio.ensure_future(stream_response())
+    cancel_coro = asyncio.ensure_future(cancel_soon())
 
     for i in range(50):
         await endpoint.broadcast(DummyRequest())
@@ -142,6 +142,10 @@ async def test_stream_can_get_cancelled(endpoint: Endpoint) -> None:
     # Ensure the registration was cleaned up
     assert len(endpoint._queues[DummyRequest]) == 0
     assert stream_counter == 2
+
+    # clean up
+    stream_coro.cancel()
+    cancel_coro.cancel()
 
 
 @pytest.mark.asyncio

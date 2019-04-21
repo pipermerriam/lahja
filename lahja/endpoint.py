@@ -1,13 +1,17 @@
 import asyncio
+from asyncio import (
+    AbstractEventLoop,
+    StreamReader,
+    StreamWriter,
+)
 import functools
 import logging
-from multiprocessing.managers import (  # type: ignore # Typeshed definition is lacking `BaseProxy`
-    BaseManager,
-    BaseProxy,
-)
+import os
 import pathlib
 import pickle
-import threading
+from types import (
+    TracebackType,
+)
 from typing import (  # noqa: F401
     Any,
     AsyncGenerator,
@@ -28,7 +32,6 @@ import uuid
 
 from ._utils import (
     wait_for_path,
-    wait_for_path_blocking,
 )
 from .exceptions import (
     ConnectionAttemptRejected,
@@ -61,36 +64,52 @@ class ConnectionConfig(NamedTuple):
             raise TypeError("Provided `base_path` must be a directory")
 
 
-class EndpointConnector:
-    """
-    Expose the receiving queue of an :class:`~lahja.endpoint.Endpoint` so that any other
-    :class:`~lahja.endpoint.Endpoint` that wants to push events into this
-    :class:`~lahja.endpoint.Endpoint` can do so via the
-    :class:`~lahja.endpoint.ProxyEndpointConnector`.
-    """
-
-    def __init__(self, endpoint: 'Endpoint') -> None:
-        self._endpoint = endpoint
-
-    def put_nowait(self, item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
-        loop = self._endpoint._loop
-        if not self._endpoint._running:
-            self._endpoint.logger.warning(
-                "Attempted to push into %s while it isn't running.",
-                self._endpoint.name
-            )
-        # We need to wrap this in `call_soon_threadsafe` since otherwise, the event loop
-        # won't pick it up until some other task moves the loop forward
-        loop.call_soon_threadsafe(self._endpoint._receiving_queue.put_nowait, item_and_config)
+class Broadcast(NamedTuple):
+    event: Union[BaseEvent, bytes]
+    config: Optional[BroadcastConfig]
 
 
-class ProxyEndpointConnector(BaseProxy):  # type: ignore # TypeShed is missing BaseProxy
-    """
-    Proxy that connects to an :class:`~lahja.endpoint.EndpointConnector`
-    """
+class RemoteEndpoint:
+    def __init__(self, reader: StreamReader, writer: StreamWriter) -> None:
+        self.writer = writer
+        self.reader = reader
+        self._drain_lock = asyncio.Lock()
 
-    def put_nowait(self, item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
-        self._callmethod('put_nowait', (item_and_config,))
+    @staticmethod
+    async def connect_to(path: str) -> 'RemoteEndpoint':
+        reader, writer = await asyncio.open_unix_connection(path)
+        return RemoteEndpoint(reader, writer)
+
+    async def send_message(self, message: Broadcast) -> None:
+        await _write_message(self.writer, message)
+        async with self._drain_lock:
+            # Use a lock to serialize drain() calls. Circumvents this bug:
+            # https://bugs.python.org/issue29930
+            await self.writer.drain()
+
+    async def read_message(self) -> Broadcast:
+        return await _read_message(self.reader)
+
+    @property
+    def more_to_read(self) -> bool:
+        return not self.reader.at_eof()
+
+
+async def _read_message(reader: StreamReader) -> Broadcast:
+    raw_size = await reader.readexactly(4)
+    size = int.from_bytes(raw_size, 'little')
+    message = await reader.readexactly(size)
+    obj = pickle.loads(message)
+    assert isinstance(obj, Broadcast)  # maybe this should be a user-friendly error?
+    return obj
+
+
+async def _write_message(writer: StreamWriter, message: Broadcast) -> None:
+    assert isinstance(message, Broadcast)
+    pickled = pickle.dumps(message)
+    size = len(pickled)
+    writer.write(size.to_bytes(4, 'little'))
+    writer.write(pickled)
 
 
 class Endpoint:
@@ -109,17 +128,22 @@ class Endpoint:
     _internal_queue: asyncio.Queue
     _internal_loop_running: asyncio.Event
 
-    _loop: asyncio.AbstractEventLoop
+    _server_running: asyncio.Event
+
+    _loop: Optional[asyncio.AbstractEventLoop]
 
     _has_snappy_support: Optional[bool] = None
 
     def __init__(self) -> None:
-        self._connected_endpoints: Dict[str, BaseProxy] = {}
+        self._connected_endpoints: Dict[str, RemoteEndpoint] = {}
         self._futures: Dict[Optional[str], asyncio.Future] = {}
         self._handler: Dict[Type[BaseEvent], List[Callable[[BaseEvent], Any]]] = {}
         self._queues: Dict[Type[BaseEvent], List[asyncio.Queue]] = {}
 
+        self._child_coros: Set[asyncio.Future] = set()
+
         self._running = False
+        self._loop = None
 
     @property
     def ipc_path(self) -> pathlib.Path:
@@ -168,10 +192,10 @@ class Endpoint:
 
         self._name = connection_config.name
         self._ipc_path = connection_config.path
-        self._create_external_api(self._ipc_path)
         self._loop = loop
         self._internal_loop_running = asyncio.Event(loop=self.event_loop)
         self._receiving_loop_running = asyncio.Event(loop=self.event_loop)
+        self._server_running = asyncio.Event(loop=self.event_loop)
         self._internal_queue = asyncio.Queue(loop=self.event_loop)
         self._receiving_queue = asyncio.Queue(loop=self.event_loop)
 
@@ -180,6 +204,7 @@ class Endpoint:
         asyncio.gather(
             asyncio.ensure_future(self._connect_receiving_queue(), loop=self.event_loop),
             asyncio.ensure_future(self._connect_internal_queue(), loop=self.event_loop),
+            asyncio.ensure_future(self._start_server(), loop=self.event_loop),
             loop=self.event_loop
         )
 
@@ -202,8 +227,32 @@ class Endpoint:
         await asyncio.gather(
             self._receiving_loop_running.wait(),
             self._internal_loop_running.wait(),
+            self._server_running.wait(),
             loop=self.event_loop
         )
+
+    async def _start_server(self) -> None:
+        self._server = await asyncio.start_unix_server(
+            self._accept_conn,
+            path=str(self.ipc_path),
+        )
+        self._server_running.set()
+
+    async def _accept_conn(self, reader: StreamReader, writer: StreamWriter) -> None:
+        remote = RemoteEndpoint(reader, writer)
+        coro = asyncio.ensure_future(self._handle_client(remote))
+        self._child_coros.add(coro)
+
+    async def _handle_client(self, remote: RemoteEndpoint) -> None:
+        while self._running and remote.more_to_read:
+            message = await remote.read_message()
+
+            if isinstance(message, Broadcast):
+                await self._receiving_queue.put((message.event, message.config))
+            else:
+                self.logger.warning(
+                    f'[{self.ipc_path}] received unexpected message: {message}'
+                )
 
     def _compress_event(self, event: BaseEvent) -> Union[BaseEvent, bytes]:
         if self.has_snappy_support:
@@ -247,38 +296,25 @@ class Endpoint:
             (item, config) = await self._internal_queue.get()
             self._process_item(item, config)
 
-    def _create_external_api(self, ipc_path: pathlib.Path) -> None:
-
-        receiver = EndpointConnector(self)
-
-        class ConnectorManager(BaseManager):
-            pass
-
-        ConnectorManager.register('get_connector', callable=lambda: receiver)  # type: ignore
-
-        manager = ConnectorManager(address=str(ipc_path))  # type: ignore
-        server = manager.get_server()   # type: ignore
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-
     def connect_to_endpoints_blocking(self, *endpoints: ConnectionConfig, timeout: int=30) -> None:
         """
         Connect to the given endpoints and block until the connection to every endpoint is
         established. Raises a ``TimeoutError`` if connections do not become available within
         ``timeout`` seconds (default 30 seconds).
         """
-        self._throw_if_already_connected(*endpoints)
-        for endpoint in endpoints:
-            wait_for_path_blocking(endpoint.path, timeout)
-            self._connect_if_not_already_connected(endpoint)
+        raise NotImplementedError()
 
     async def connect_to_endpoints(self, *endpoints: ConnectionConfig) -> None:
         """
         Connect to the given endpoints and await until all connections are established.
         """
         self._throw_if_already_connected(*endpoints)
+        loop = None
+        if self._loop:
+            loop = self.event_loop
         await asyncio.gather(
             *(self._await_connect_to_endpoint(endpoint) for endpoint in endpoints),
-            loop=self.event_loop
+            loop=cast(AbstractEventLoop, loop)
         )
 
     def connect_to_endpoints_nowait(self, *endpoints: ConnectionConfig) -> None:
@@ -291,28 +327,18 @@ class Endpoint:
 
     async def _await_connect_to_endpoint(self, endpoint: ConnectionConfig) -> None:
         await wait_for_path(endpoint.path)
-        self._connect_if_not_already_connected(endpoint)
+        await self.connect_to_endpoint(endpoint)
 
-    def _connect_if_not_already_connected(self, endpoint: ConnectionConfig) -> None:
-
-        if endpoint.name in self._connected_endpoints.keys():
+    async def connect_to_endpoint(self, config: ConnectionConfig) -> None:
+        if config.name in self._connected_endpoints.keys():
             self.logger.warning(
                 "Tried to connect to %s but we are already connected to that Endpoint",
-                endpoint.name
+                config.name
             )
             return
 
-        class ConnectorManager(BaseManager):
-            pass
-
-        ConnectorManager.register(  # type: ignore
-            'get_connector',
-            proxytype=ProxyEndpointConnector
-        )
-
-        manager = ConnectorManager(address=str(endpoint.path))  # type: ignore
-        manager.connect()
-        self._connected_endpoints[endpoint.name] = manager.get_connector()  # type: ignore
+        remote = await RemoteEndpoint.connect_to(str(config.path))
+        self._connected_endpoints[config.name] = remote
 
     def is_connected_to(self, endpoint_name: str) -> bool:
         return endpoint_name in self._connected_endpoints
@@ -355,6 +381,19 @@ class Endpoint:
         self._running = False
         self._receiving_queue.put_nowait((TRANSPARENT_EVENT, None))
         self._internal_queue.put_nowait((TRANSPARENT_EVENT, None))
+        for coro in self._child_coros:
+            coro.cancel()
+        self._server.close()
+        os.unlink(self.ipc_path)
+
+    def __enter__(self) -> 'Endpoint':
+        return self
+
+    def __exit__(self,
+                 exc_type: Optional[Type[BaseException]],
+                 exc_value: Optional[BaseException],
+                 exc_tb: Optional[TracebackType]) -> None:
+        self.stop()
 
     async def broadcast(self, item: BaseEvent, config: Optional[BroadcastConfig] = None) -> None:
         """
@@ -362,17 +401,6 @@ class Endpoint:
         an optional second parameter of :class:`~lahja.misc.BroadcastConfig` to decide
         where this event should be broadcasted to. By default, events are broadcasted across
         all connected endpoints with their consuming call sites.
-        """
-        self.broadcast_nowait(item, config)
-
-    def broadcast_nowait(self,
-                         item: BaseEvent,
-                         config: Optional[BroadcastConfig] = None) -> None:
-        """
-        A non-async `broadcast()` (see the docstring for `broadcast()` for more)
-
-        Instead of blocking the calling coroutine this function schedules the broadcast
-        and immediately returns.
         """
         item._origin = self.name
         if config is not None and config.internal:
@@ -382,10 +410,28 @@ class Endpoint:
         else:
             # Broadcast to every connected Endpoint that is allowed to receive the event
             compressed_item = self._compress_event(item)
-            for name, connector in self._connected_endpoints.items():
+            for name, remote in self._connected_endpoints.items():
                 allowed = (config is None) or config.allowed_to_receive(name)
                 if allowed:
-                    connector.put_nowait((compressed_item, config))
+                    await remote.send_message(Broadcast(compressed_item, config))
+
+    def broadcast_nowait(self,
+                         item: BaseEvent,
+                         config: Optional[BroadcastConfig] = None) -> None:
+        """
+        A non-async `broadcast()` (see the docstring for `broadcast()` for more)
+
+        Instead of blocking the calling coroutine this function schedules the broadcast
+        and immediately returns.
+
+        CAUTION: You probably don't want to use this. broadcast() doesn't return until the
+        write socket has finished draining, meaning that the OS has accepted the message.
+        This prevents us from sending more data than the remote process can handle.
+        broadcast_nowait has no such backpressure. Even after the remote process stops
+        accepting new messages this function will continue to accept them, which in the
+        worst case could lead to runaway memory usage.
+        """
+        asyncio.ensure_future(self.broadcast(item, config))
 
     TResponse = TypeVar('TResponse', bound=BaseEvent)
 
