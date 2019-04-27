@@ -6,7 +6,6 @@ from asyncio import (
 )
 import functools
 import logging
-import os
 import pathlib
 import pickle
 from types import (
@@ -91,12 +90,15 @@ class RemoteEndpoint:
         return await _read_message(self.reader)
 
     @property
-    def more_to_read(self) -> bool:
+    def reader_not_at_eof(self) -> bool:
         return not self.reader.at_eof()
 
 
+SIZE_MARKER_LENGTH = 4
+
+
 async def _read_message(reader: StreamReader) -> Broadcast:
-    raw_size = await reader.readexactly(4)
+    raw_size = await reader.readexactly(SIZE_MARKER_LENGTH)
     size = int.from_bytes(raw_size, 'little')
     message = await reader.readexactly(size)
     obj = pickle.loads(message)
@@ -108,7 +110,7 @@ async def _write_message(writer: StreamWriter, message: Broadcast) -> None:
     assert isinstance(message, Broadcast)
     pickled = pickle.dumps(message)
     size = len(pickled)
-    writer.write(size.to_bytes(4, 'little'))
+    writer.write(size.to_bytes(SIZE_MARKER_LENGTH, 'little'))
     writer.write(pickled)
 
 
@@ -241,10 +243,11 @@ class Endpoint:
     async def _accept_conn(self, reader: StreamReader, writer: StreamWriter) -> None:
         remote = RemoteEndpoint(reader, writer)
         coro = asyncio.ensure_future(self._handle_client(remote))
+        coro.add_done_callback(lambda fut: self._child_coros.remove(fut))
         self._child_coros.add(coro)
 
     async def _handle_client(self, remote: RemoteEndpoint) -> None:
-        while self._running and remote.more_to_read:
+        while self._running and remote.reader_not_at_eof:
             message = await remote.read_message()
 
             if isinstance(message, Broadcast):
@@ -376,7 +379,7 @@ class Endpoint:
         for coro in self._child_coros:
             coro.cancel()
         self._server.close()
-        os.unlink(self.ipc_path)
+        self.ipc_path.unlink()
 
     def __enter__(self) -> 'Endpoint':
         return self
