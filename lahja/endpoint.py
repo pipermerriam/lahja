@@ -296,14 +296,6 @@ class Endpoint:
             (item, config) = await self._internal_queue.get()
             self._process_item(item, config)
 
-    def connect_to_endpoints_blocking(self, *endpoints: ConnectionConfig, timeout: int=30) -> None:
-        """
-        Connect to the given endpoints and block until the connection to every endpoint is
-        established. Raises a ``TimeoutError`` if connections do not become available within
-        ``timeout`` seconds (default 30 seconds).
-        """
-        raise NotImplementedError()
-
     async def connect_to_endpoints(self, *endpoints: ConnectionConfig) -> None:
         """
         Connect to the given endpoints and await until all connections are established.
