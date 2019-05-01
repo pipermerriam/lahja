@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import asyncio
 from asyncio import (
     AbstractEventLoop,
@@ -114,7 +115,21 @@ async def _write_message(writer: StreamWriter, message: Broadcast) -> None:
     writer.write(pickled)
 
 
-class Endpoint:
+class BaseEndpoint(ABC):
+    @abstractmethod
+    async def start_serving(self, connection_config: ConnectionConfig) -> None:
+        pass
+
+    @abstractmethod
+    async def connect_to_endpoint(self, config: ConnectionConfig) -> None:
+        pass
+
+    @abstractmethod
+    def is_connected_to(self, endpoint_name: str) -> bool:
+        pass
+
+
+class Endpoint(BaseEndpoint):
     """
     The :class:`~lahja.endpoint.Endpoint` enables communication between different processes
     as well as within a single process via various event-driven APIs.
@@ -172,12 +187,8 @@ class Endpoint:
     @property
     def has_snappy_support(self) -> bool:
         if self._has_snappy_support is None:
-            try:
-                import snappy  # noqa: F401
-                self._has_snappy_support = True
-            except ModuleNotFoundError:
-                self._has_snappy_support = False
-
+            from lahja.snappy import is_snappy_available
+            self._has_snappy_support = is_snappy_available
         return self._has_snappy_support
 
     def start_serving_nowait(self,
