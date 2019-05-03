@@ -70,14 +70,18 @@ class Broadcast(NamedTuple):
 
 
 class RemoteEndpoint:
+    logger = logging.getLogger('lahja.endpoint.RemoteEndpoint')
+
     def __init__(self, reader: StreamReader, writer: StreamWriter) -> None:
         self.writer = writer
         self.reader = reader
         self._drain_lock = asyncio.Lock()
 
-    @staticmethod
-    async def connect_to(path: str) -> 'RemoteEndpoint':
+    @classmethod
+    async def connect_to(cls, path: str) -> 'RemoteEndpoint':
+        cls.logger.debug('Connecting to %s', path)
         reader, writer = await asyncio.open_unix_connection(path)
+        cls.logger.debug('Connected to %s', path)
         return RemoteEndpoint(reader, writer)
 
     async def send_message(self, message: Broadcast) -> None:
@@ -106,6 +110,7 @@ async def _read_message(reader: StreamReader) -> Broadcast:
     message = await reader.readexactly(size)
     obj = pickle.loads(message)
     assert isinstance(obj, Broadcast)
+    logging.info('READ msg: %s', obj)
     return obj
 
 
@@ -198,12 +203,8 @@ class Endpoint:
     @property
     def has_snappy_support(self) -> bool:
         if self._has_snappy_support is None:
-            try:
-                import snappy  # noqa: F401
-                self._has_snappy_support = True
-            except ModuleNotFoundError:
-                self._has_snappy_support = False
-
+            from lahja.snappy import is_snappy_available
+            self._has_snappy_support = is_snappy_available
         return self._has_snappy_support
 
     @check_event_loop
@@ -247,12 +248,14 @@ class Endpoint:
         self._server_running.set()
 
     async def _accept_conn(self, reader: StreamReader, writer: StreamWriter) -> None:
+        self.logger.info("Server accepted connection")
         remote = RemoteEndpoint(reader, writer)
         coro = asyncio.ensure_future(self._handle_client(remote))
         coro.add_done_callback(lambda fut: self._child_coros.remove(fut))
         self._child_coros.add(coro)
 
     async def _handle_client(self, remote: RemoteEndpoint) -> None:
+        self.logger.info("Server client handler running")
         while self._running:
             try:
                 message = await remote.read_message()

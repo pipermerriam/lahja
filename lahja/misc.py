@@ -35,6 +35,15 @@ class BroadcastConfig:
         if self.internal and self.filter_endpoint is not None:
             raise ValueError("`internal` can not be used with `filter_endpoint")
 
+    def __str__(self) -> str:
+        return (
+            "BroadcastConfig["
+            f"{'internal' if self.internal else 'external'} / "
+            f"endpoint={self.filter_endpoint if self.filter_endpoint else 'N/A'} / "
+            f"  id={self.filter_event_id if self.filter_event_id else 'N/A'}"
+            "]"
+        )
+
     def allowed_to_receive(self, endpoint: str) -> bool:
         return self.filter_endpoint is None or self.filter_endpoint == endpoint
 
@@ -56,6 +65,10 @@ class BaseEvent:
             filter_endpoint=self._origin,
             filter_event_id=self._id
         )
+
+
+class _Hello(BaseEvent):
+    pass
 
 
 TResponse = TypeVar('TResponse', bound=BaseEvent)
