@@ -48,11 +48,11 @@ class BroadcastConfig:
             "BroadcastConfig["
             f"{'internal' if self.internal else 'external'} / "
             f"endpoint={self.filter_endpoint if self.filter_endpoint else 'N/A'} / "
-            f"  id={self.filter_event_id if self.filter_event_id else 'N/A'}"
+            f"id={self.filter_event_id if self.filter_event_id else 'N/A'}"
             "]"
         )
 
-    def allowed_to_receive(self, endpoint: str) -> bool:
+    def allowed_to_receive(self, endpoint: Optional[str]) -> bool:
         return self.filter_endpoint is None or self.filter_endpoint == endpoint
 
 

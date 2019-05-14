@@ -32,9 +32,9 @@ from typing import (  # noqa: F401
 
 from async_generator import asynccontextmanager
 
-from lahja._snappy import check_has_snappy_support
 from lahja.base import (
     BaseEndpoint,
+    BaseRemoteEndpoint,
     ConnectionAPI,
     TResponse,
     TStreamEvent,
@@ -126,7 +126,7 @@ class Connection(ConnectionAPI):
             raise RemoteDisconnected()
 
 
-class RemoteEndpoint:
+class RemoteEndpoint(BaseRemoteEndpoint):
     """
     Represents a connection to another endpoint.  Connections *can* be
     bi-directional with messages flowing in either direction.
@@ -151,7 +151,7 @@ class RemoteEndpoint:
         new_msg_func: Callable[[Broadcast], Awaitable[Any]],
     ) -> None:
         self.name = name
-        self.conn = conn
+        self._conn = conn
         self.new_msg_func = new_msg_func
 
         self.subscribed_messages: Set[Type[BaseEvent]] = set()
@@ -193,11 +193,14 @@ class RemoteEndpoint:
         self._task.cancel()
 
     async def _run(self) -> None:
+        # TODO: if we can properly define the *Condition* API, this
+        # implementation can be made common between the asyncio and trio
+        # implementations.
         self._running.set()
 
         while self.is_running:
             try:
-                message = await self.conn.read_message()
+                message = await self._conn.read_message()
             except RemoteDisconnected:
                 async with self._received_response:
                     self._received_response.notify_all()
@@ -235,26 +238,13 @@ class RemoteEndpoint:
         async with self._notify_lock:
             async with self._received_response:
                 try:
-                    await self.conn.send_message(
+                    await self._conn.send_message(
                         SubscriptionsUpdated(subscriptions, block)
                     )
                 except RemoteDisconnected:
                     return
                 if block:
                     await self._received_response.wait()
-
-    def can_send_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> bool:
-        if config is not None:
-            if self.name is not None and not config.allowed_to_receive(self.name):
-                return False
-            elif config.filter_event_id is not None:
-                # the item is a response to a request.
-                return True
-
-        return type(item) in self.subscribed_messages
-
-    async def send_message(self, message: Msg) -> None:
-        await self.conn.send_message(message)
 
     async def wait_until_subscription_received(self) -> None:
         async with self._received_subscription:
@@ -398,11 +388,6 @@ class AsyncioEndpoint(BaseEndpoint):
             return func(self, *args, **kwargs)
 
         return cast(TFunc, run)
-
-    # This property gets assigned during class creation.  This should be ok
-    # since snappy support is defined as the module being importable and that
-    # should not change during the lifecycle of the python process.
-    has_snappy_support = check_has_snappy_support()
 
     @check_event_loop
     async def start(self) -> None:
@@ -575,24 +560,8 @@ class AsyncioEndpoint(BaseEndpoint):
         """
         return tuple(
             (outbound.name, outbound.subscribed_messages)
-            for outbound in self._full_connections.values()
+            for outbound in self._connections
         )
-
-    def _compress_event(self, event: BaseEvent) -> Union[BaseEvent, bytes]:
-        if self.has_snappy_support:
-            import snappy
-
-            return cast(bytes, snappy.compress(pickle.dumps(event)))
-        else:
-            return event
-
-    def _decompress_event(self, data: Union[BaseEvent, bytes]) -> BaseEvent:
-        if isinstance(data, BaseEvent):
-            return data
-        else:
-            import snappy
-
-            return cast(BaseEvent, pickle.loads(snappy.decompress(data)))
 
     def _throw_if_already_connected(self, *endpoints: ConnectionConfig) -> None:
         seen: Set[str] = set()
@@ -677,29 +646,20 @@ class AsyncioEndpoint(BaseEndpoint):
             await remote.notify_subscriptions_updated(self.subscribed_events)
             await self._add_connection(remote)
 
+    async def wait_until_connections_change(self) -> None:
+        async with self._connections_changed:
+            await self._connections_changed.wait()
+
     async def _handle_server(self, remote: RemoteEndpoint) -> None:
         async with run_remote_endpoint(remote):
             await remote.wait_stopped()
 
     async def watch_outbound_subscriptions(self, outbound: RemoteEndpoint) -> None:
-        while outbound in self._full_connections.values():
+        while outbound in self._connections:
             await outbound.wait_until_subscription_received()
             await self.broadcast(
                 RemoteSubscriptionChanged(), BroadcastConfig(internal=True)
             )
-
-    def is_connected_to(self, endpoint_name: str) -> bool:
-        return any(endpoint_name == remote.name for remote in self._connections)
-
-    async def wait_until_connected_to(self, endpoint_name: str) -> None:
-        if self.is_connected_to(endpoint_name):
-            return
-
-        async with self._connections_changed:
-            while True:
-                await self._connections_changed.wait()
-                if self.is_connected_to(endpoint_name):
-                    return
 
     async def _add_connection(self, remote: RemoteEndpoint) -> None:
         if remote in self._connections:
@@ -766,7 +726,7 @@ class AsyncioEndpoint(BaseEndpoint):
 
         self.logger.debug("Endpoint[%s]: stopped", self.name)
 
-    @asynccontextmanager  # type: ignore
+    @asynccontextmanager
     async def run(self) -> AsyncIterator["AsyncioEndpoint"]:
         if not self._loop:
             self._loop = asyncio.get_event_loop()
@@ -779,7 +739,7 @@ class AsyncioEndpoint(BaseEndpoint):
             self.stop()
 
     @classmethod
-    @asynccontextmanager  # type: ignore
+    @asynccontextmanager
     async def serve(cls, config: ConnectionConfig) -> AsyncIterator["AsyncioEndpoint"]:
         endpoint = cls(config.name)
         async with endpoint.run():

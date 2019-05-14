@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+import itertools
 import logging
 from pathlib import Path
+import pickle
 from typing import (  # noqa: F401
     Any,
     AsyncContextManager,
@@ -20,6 +22,7 @@ from typing import (  # noqa: F401
     cast,
 )
 
+from ._snappy import check_has_snappy_support
 from .common import (
     BaseEvent,
     BaseRequestResponseEvent,
@@ -30,6 +33,7 @@ from .common import (
     RemoteSubscriptionChanged,
     Subscription,
 )
+from .typing import RequestID
 
 TResponse = TypeVar("TResponse", bound=BaseEvent)
 TWaitForEvent = TypeVar("TWaitForEvent", bound=BaseEvent)
@@ -45,11 +49,56 @@ class ConnectionAPI(ABC):
 
     @abstractmethod
     async def send_message(self, message: Msg) -> None:
-        pass
+        ...
 
     @abstractmethod
     async def read_message(self) -> Message:
-        pass
+        ...
+
+
+class RemoteEndpointAPI(ABC):
+    name: Optional[str]
+    subscribed_messages: Set[Type[BaseEvent]]
+    _conn: ConnectionAPI
+
+    @abstractmethod
+    async def notify_subscriptions_updated(
+        self, subscriptions: Set[Type[BaseEvent]], block: bool = True
+    ) -> None:
+        """
+        Alert the ``Endpoint`` which has connected to us that our subscription set has
+        changed. If ``block`` is ``True`` then this function will block until the remote
+        endpoint has acknowledged the new subscription set. If ``block`` is ``False`` then this
+        function will return immediately after the send finishes.
+        """
+        ...
+
+    @abstractmethod
+    def can_send_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> bool:
+        ...
+
+    @abstractmethod
+    async def send_message(self, message: Msg) -> None:
+        ...
+
+    @abstractmethod
+    async def wait_until_subscription_received(self) -> None:
+        ...
+
+
+class BaseRemoteEndpoint(RemoteEndpointAPI):
+    def can_send_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> bool:
+        if config is not None:
+            if self.name is not None and not config.allowed_to_receive(self.name):
+                return False
+            elif config.filter_event_id is not None:
+                # the item is a response to a request.
+                return True
+
+        return type(item) in self.subscribed_messages
+
+    async def send_message(self, message: Msg) -> None:
+        await self._conn.send_message(message)
 
 
 class EndpointAPI(ABC):
@@ -119,6 +168,23 @@ class EndpointAPI(ABC):
     def is_connected_to(self, endpoint_name: str) -> bool:
         """
         Return whether this endpoint is connected to another endpoint with the given name.
+        """
+        ...
+
+    @abstractmethod
+    async def wait_until_connected_to(self, endpoint_name: str) -> None:
+        """
+        Block until connected to the named endpoint
+        """
+        ...
+
+    @abstractmethod
+    async def wait_until_connections_change(self) -> None:
+        """
+        Block until a change occurs in the remotes we are connected to.
+
+        - new inbound or outbound connection
+        - reverse connection
         """
         ...
 
@@ -272,8 +338,25 @@ class BaseEndpoint(EndpointAPI):
     """
     Base class for endpoint implementations that implements shared/common logic
     """
-
     logger = logging.getLogger("lahja.endpoint.Endpoint")
+
+    def __init__(self) -> None:
+        try:
+            # Trim the name to 20 characters in the case of overly long names
+            # not causing us to take a performance hit constantly transporting it across the wire.
+            self._request_id_base = self.name[:28].encode("ascii") + ":"
+        except UnicodeDecodeError:
+            raise Exception(
+                f"TODO: Invalid endpoint name: '{self.name}'. Must be ASCII encodable string"
+            )
+        self._request_id_counter = itertools.count()
+
+    #
+    # Generation of request ids
+    #
+    def _get_request_id(self) -> RequestID:
+        request_id = next(self._request_id_counter) % 65536
+        return cast(RequestID, self._request_id_base + request_id.to_bytes(2, "little"))
 
     #
     # Common implementations
@@ -289,6 +372,22 @@ class BaseEndpoint(EndpointAPI):
         for config in endpoints:
             await self.connect_to_endpoint(config)
 
+    def is_connected_to(self, endpoint_name: str) -> bool:
+        return any(
+            name == endpoint_name
+            for name, _
+            in self.get_connected_endpoints_and_subscriptions()
+        )
+
+    async def wait_until_connected_to(self, endpoint_name: str) -> None:
+        while True:
+            if self.is_connected_to(endpoint_name):
+                break
+            await self.wait_until_connections_change()
+
+    #
+    # Event API
+    #
     async def wait_for(self, event_type: Type[TWaitForEvent]) -> TWaitForEvent:
         """
         Wait for a single instance of an event that matches the specified event type.
@@ -298,6 +397,9 @@ class BaseEndpoint(EndpointAPI):
         await agen.aclose()
         return event
 
+    #
+    # Subscription API
+    #
     def is_remote_subscribed_to(
         self, remote_endpoint: str, event_type: Type[BaseEvent]
     ) -> bool:
@@ -380,3 +482,28 @@ class BaseEndpoint(EndpointAPI):
         async for _ in self.stream(RemoteSubscriptionChanged):  # noqa: F841
             if self.are_all_remotes_subscribed_to(event):
                 return
+
+    #
+    # Compression
+    #
+
+    # This property gets assigned during class creation.  This should be ok
+    # since snappy support is defined as the module being importable and that
+    # should not change during the lifecycle of the python process.
+    has_snappy_support = check_has_snappy_support()
+
+    def _compress_event(self, event: BaseEvent) -> Union[BaseEvent, bytes]:
+        if self.has_snappy_support:
+            import snappy
+
+            return cast(bytes, snappy.compress(pickle.dumps(event)))
+        else:
+            return event
+
+    def _decompress_event(self, data: Union[BaseEvent, bytes]) -> BaseEvent:
+        if isinstance(data, BaseEvent):
+            return data
+        else:
+            import snappy
+
+            return cast(BaseEvent, pickle.loads(snappy.decompress(data)))
