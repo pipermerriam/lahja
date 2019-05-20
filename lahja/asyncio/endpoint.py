@@ -233,18 +233,32 @@ class AsyncioEndpoint(BaseEndpoint):
     as well as within a single process via various event-driven APIs.
     """
 
-    _name: str
-    _ipc_path: pathlib.Path
+    __slots__ = (
+        "ipc_path",
+        "_child_tasks",
+        "_full_connections",
+        "_futures",
+        "_half_connections",
+        "_handlers",
+        "_internal_queue",
+        "_queues",
+        "_receiving_loop_running",
+        "_receiving_queue",
+        "_receiving_queue",
+        "_running",
+        "_server_running",
+        "_serving",
+        "_who_are_you_stream_handler_running",
+    )
+
+    ipc_path: pathlib.Path
 
     _receiving_queue: "asyncio.Queue[Tuple[Union[bytes, BaseEvent], Optional[BroadcastConfig]]]"
     _receiving_loop_running: asyncio.Event
 
-    _internal_queue: "asyncio.Queue[Tuple[BaseEvent, Optional[BroadcastConfig]]]"
-    _internal_loop_running: asyncio.Event
-
     _server_running: asyncio.Event
 
-    _loop: Optional[asyncio.AbstractEventLoop]
+    _loop: Optional[asyncio.AbstractEventLoop] = None
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -270,11 +284,7 @@ class AsyncioEndpoint(BaseEndpoint):
         self._child_tasks: Set["asyncio.Future[Any]"] = set()
 
         self._running = False
-        self._loop = None
-
-    @property
-    def ipc_path(self) -> pathlib.Path:
-        return self._ipc_path
+        self._serving = False
 
     @property
     def event_loop(self) -> asyncio.AbstractEventLoop:
@@ -302,12 +312,6 @@ class AsyncioEndpoint(BaseEndpoint):
 
         return cast(TFunc, run)
 
-    @property
-    def name(  # type: ignore  # mypy thinks the signature does not match EndpointAPI
-        self
-    ) -> str:
-        return self._name
-
     # This property gets assigned during class creation.  This should be ok
     # since snappy support is defined as the module being importable and that
     # should not change during the lifecycle of the python process.
@@ -320,19 +324,13 @@ class AsyncioEndpoint(BaseEndpoint):
         can receive events. Await until the
         :class:`~lahja.asyncio.AsyncioEndpoint` is ready.
         """
-        self._name = connection_config.name
-        self._ipc_path = connection_config.path
-        self._internal_loop_running = asyncio.Event()
-        self._receiving_loop_running = asyncio.Event()
+        self.ipc_path = connection_config.path
+
         self._server_running = asyncio.Event()
-        self._internal_queue = asyncio.Queue()
-        self._receiving_queue = asyncio.Queue()
 
-        asyncio.ensure_future(self._connect_receiving_queue())
-        asyncio.ensure_future(self._connect_internal_queue())
+        self._serving = True
+
         asyncio.ensure_future(self._start_server())
-
-        self._running = True
 
         await self.wait_until_serving()
 
@@ -341,11 +339,7 @@ class AsyncioEndpoint(BaseEndpoint):
         """
         Await until the ``Endpoint`` is ready to receive events.
         """
-        await asyncio.gather(
-            self._receiving_loop_running.wait(),
-            self._internal_loop_running.wait(),
-            self._server_running.wait(),
-        )
+        await self._server_running.wait()
 
     async def _start_server(self) -> None:
         self._server = await asyncio.start_unix_server(
@@ -623,16 +617,21 @@ class AsyncioEndpoint(BaseEndpoint):
         if not self._running:
             return
 
+        if self._serving:
+            self._server.close()
+            self.ipc_path.unlink()
+
         self._running = False
         for task in self._child_tasks:
             task.cancel()
-        self._server.close()
-        self.ipc_path.unlink()
 
     @asynccontextmanager  # type: ignore
     async def run(self) -> AsyncIterator["AsyncioEndpoint"]:
         if not self._loop:
             self._loop = asyncio.get_event_loop()
+
+        await self.start()
+
         try:
             yield self
         finally:
@@ -641,7 +640,7 @@ class AsyncioEndpoint(BaseEndpoint):
     @classmethod
     @asynccontextmanager  # type: ignore
     async def serve(cls, config: ConnectionConfig) -> AsyncIterator["AsyncioEndpoint"]:
-        endpoint = cls()
+        endpoint = cls(config.name)
         async with endpoint.run():
             await endpoint.start_serving(config)
             yield endpoint
