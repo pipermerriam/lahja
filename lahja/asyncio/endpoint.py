@@ -1,6 +1,8 @@
 import asyncio
 from asyncio import StreamReader, StreamWriter
+from collections import defaultdict
 import functools
+import inspect
 import itertools
 import logging
 import pathlib
@@ -12,6 +14,7 @@ from typing import (  # noqa: F401
     AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -220,6 +223,10 @@ class RemoteEndpoint:
 TFunc = TypeVar("TFunc", bound=Callable[..., Any])
 
 
+SubscriptionAsyncHandler = Callable[[BaseEvent], Awaitable[Any]]
+SubscriptionSyncHandler = Callable[[BaseEvent], Any]
+
+
 class AsyncioEndpoint(BaseEndpoint):
     """
     The :class:`~lahja.asyncio.AsyncioEndpoint` enables communication between different processes
@@ -239,13 +246,25 @@ class AsyncioEndpoint(BaseEndpoint):
 
     _loop: Optional[asyncio.AbstractEventLoop]
 
+    def __init__(self, name: str) -> None:
+        self.name = name
+
         # connections that we expect to both send and receive events.
         self._full_connections: Dict[str, RemoteEndpoint] = {}
         # connections that we will only receive events from.
         self._half_connections: Set[RemoteEndpoint] = set()
 
         self._futures: Dict[Optional[str], "asyncio.Future[BaseEvent]"] = {}
-        self._handler: Dict[Type[BaseEvent], List[Callable[[BaseEvent], Any]]] = {}
+        self._async_handler: Dict[
+            Type[BaseEvent], List[SubscriptionAsyncHandler]
+        ] = defaultdict(
+            list
+        )  # noqa: E501
+        self._sync_handler: Dict[
+            Type[BaseEvent], List[SubscriptionSyncHandler]
+        ] = defaultdict(
+            list
+        )  # noqa: E501
         self._queues: Dict[Type[BaseEvent], List["asyncio.Queue[BaseEvent]"]] = {}
 
         self._child_tasks: Set["asyncio.Future[Any]"] = set()
@@ -361,7 +380,11 @@ class AsyncioEndpoint(BaseEndpoint):
         """
         Return the set of events this Endpoint is currently listening for
         """
-        return set(self._handler.keys()) | set(self._queues.keys())
+        return (
+            set(self._sync_handler.keys())
+            .union(self._async_handler.keys())
+            .union(self._queues.keys())
+        )
 
     async def _notify_subscriptions_changed(self) -> None:
         """
@@ -513,10 +536,7 @@ class AsyncioEndpoint(BaseEndpoint):
     def is_connected_to(self, endpoint_name: str) -> bool:
         return endpoint_name in self._full_connections
 
-    def _process_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> None:
-        if item is TRANSPARENT_EVENT:
-            return
-
+    async def _process_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> None:
         event_type = type(item)
 
         if config is not None and config.filter_event_id in self._futures:
@@ -529,9 +549,13 @@ class AsyncioEndpoint(BaseEndpoint):
             for queue in self._queues[event_type]:
                 queue.put_nowait(item)
 
-        if event_type in self._handler:
-            for handler in self._handler[event_type]:
+        if event_type in self._sync_handler:
+            for handler in self._sync_handler[event_type]:
                 handler(item)
+
+        if event_type in self._async_handler:
+            for handler in self._async_handler[event_type]:
+                await handler(item)
 
     async def _who_are_you_stream_handler(self) -> None:
         """
@@ -600,8 +624,6 @@ class AsyncioEndpoint(BaseEndpoint):
             return
 
         self._running = False
-        self._receiving_queue.put_nowait((TRANSPARENT_EVENT, None))
-        self._internal_queue.put_nowait((TRANSPARENT_EVENT, None))
         for task in self._child_tasks:
             task.cancel()
         self._server.close()
@@ -718,34 +740,56 @@ class AsyncioEndpoint(BaseEndpoint):
         except asyncio.CancelledError:
             self._futures.pop(id, None)
 
-    def subscribe(
+    def _remove_async_subscription(
+        self, event_type: Type[BaseEvent], handler_fn: SubscriptionAsyncHandler
+    ) -> None:
+        self._async_handler[event_type].remove(handler_fn)
+        if not self._async_handler[event_type]:
+            self._async_handler.pop(event_type)
+        # this is asynchronous because that's a better user experience than making
+        # the user `await subscription.remove()`. This means this Endpoint will keep
+        # getting events for a little while after it stops listening for them but
+        # that's a performance problem, not a correctness problem.
+        asyncio.ensure_future(self._notify_subscriptions_changed())
+
+    def _remove_sync_subscription(
+        self, event_type: Type[BaseEvent], handler_fn: SubscriptionSyncHandler
+    ) -> None:
+        self._sync_handler[event_type].remove(handler_fn)
+        if not self._sync_handler[event_type]:
+            self._sync_handler.pop(event_type)
+        # this is asynchronous because that's a better user experience than making
+        # the user `await subscription.remove()`. This means this Endpoint will keep
+        # getting events for a little while after it stops listening for them but
+        # that's a performance problem, not a correctness problem.
+        asyncio.ensure_future(self._notify_subscriptions_changed())
+
+    async def subscribe(
         self,
         event_type: Type[TSubscribeEvent],
-        handler: Callable[[TSubscribeEvent], None],
+        handler: Callable[[TSubscribeEvent], Union[Any, Awaitable[Any]]],
     ) -> Subscription:
         """
         Subscribe to receive updates for any event that matches the specified event type.
         A handler is passed as a second argument an :class:`~lahja.common.Subscription` is returned
         to unsubscribe from the event if needed.
         """
-        if event_type not in self._handler:
-            self._handler[event_type] = []
+        if inspect.iscoroutine(handler):
+            casted_handler = cast(Callable[[BaseEvent], Any], handler)
+            self._async_handler[event_type].append(casted_handler)
+            unsubscribe_fn = functools.partial(
+                self._remove_async_subscription, event_type, casted_handler
+            )
+        else:
+            casted_handler = cast(Callable[[BaseEvent], Any], handler)
+            self._sync_handler[event_type].append(casted_handler)
+            unsubscribe_fn = functools.partial(
+                self._remove_sync_subscription, event_type, casted_handler
+            )
 
-        casted_handler = cast(Callable[[BaseEvent], Any], handler)
+        await self._notify_subscriptions_changed()
 
-        self._handler[event_type].append(casted_handler)
-        # It's probably better to make subscribe() async and await this coro
-        asyncio.ensure_future(self._notify_subscriptions_changed())
-
-        def remove() -> None:
-            self._handler[event_type].remove(casted_handler)
-            # this is asynchronous because that's a better user experience than making
-            # the user `await subscription.remove()`. This means this Endpoint will keep
-            # getting events for a little while after it stops listening for them but
-            # that's a performance problem, not a correctness problem.
-            asyncio.ensure_future(self._notify_subscriptions_changed())
-
-        return Subscription(remove)
+        return Subscription(unsubscribe_fn)
 
     async def stream(
         self, event_type: Type[TStreamEvent], num_events: Optional[int] = None

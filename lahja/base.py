@@ -4,6 +4,7 @@ from typing import (  # noqa: F401
     Any,
     AsyncContextManager,
     AsyncGenerator,
+    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -38,6 +39,8 @@ class EndpointAPI(ABC):
     as well as within a single process via various event-driven APIs.
     """
 
+    __slots__ = ("name",)
+
     name: str
 
     #
@@ -53,6 +56,7 @@ class EndpointAPI(ABC):
             async with endpoint.run() as endpoint:
                 # endpoint running within context
             # endpoint stopped after
+
         """
         pass
 
@@ -67,6 +71,7 @@ class EndpointAPI(ABC):
             async with endpoint.serve():
                 # server running within context
             # server stopped
+
         """
         pass
 
@@ -135,10 +140,10 @@ class EndpointAPI(ABC):
         pass
 
     @abstractmethod
-    def subscribe(
+    async def subscribe(
         self,
         event_type: Type[TSubscribeEvent],
-        handler: Callable[[TSubscribeEvent], None],
+        handler: Callable[[TSubscribeEvent], Union[Any, Awaitable[Any]]],
     ) -> Subscription:
         """
         Subscribe to receive updates for any event that matches the specified event type.
