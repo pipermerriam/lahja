@@ -93,6 +93,14 @@ class EndpointAPI(ABC):
         pass
 
     @abstractmethod
+    async def wait_connected_to(self, endpoint_name: str) -> None:
+        """
+        Block until a this endpoint is connected to an endpoint with the given
+        name.
+        """
+        pass
+
+    @abstractmethod
     async def wait_until_any_connection_subscribed_to(
         self, event: Type[BaseEvent]
     ) -> None:

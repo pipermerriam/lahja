@@ -528,9 +528,15 @@ class AsyncioEndpoint(BaseEndpoint):
         await remote.wait_until_subscription_received()
 
     def is_connected_to(self, endpoint_name: str) -> bool:
-        return endpoint_name in self._full_connections
+        return endpoint_name in self._outbound_connections
 
-    async def _process_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> None:
+    async def wait_connected_to(self, endpoint_name: str) -> None:
+        while not self.is_connected_to(endpoint_name):
+            await asyncio.sleep(0.01)
+
+    async def _process_item(
+        self, item: BaseEvent, config: Optional[BroadcastConfig]
+    ) -> None:
         event_type = type(item)
 
         if config is not None and config.filter_event_id in self._futures:
