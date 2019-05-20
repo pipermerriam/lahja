@@ -660,26 +660,49 @@ class AsyncioEndpoint(BaseEndpoint):
         where this event should be broadcasted to. By default, events are broadcasted across
         all connected endpoints with their consuming call sites.
         """
-        item._origin = self.name
+
         if config is not None and config.internal:
-            # Internal events simply bypass going through the central event bus
-            # and are directly put into the local receiving queue instead.
-            self._internal_queue.put_nowait((item, config))
+            # Internal events can just be directly processed
+            if not item.is_bound:
+                item.bind(self)
+            await self._process_item(item, config)
             return
 
         # Broadcast to every connected Endpoint that is allowed to receive the event
+        remote_pairs_for_broadcast = tuple(
+            (name, remote)
+            for name, remote in self._full_connections.items()
+            if remote.can_send_item(item, config)
+        )
+        if not remote_pairs_for_broadcast:
+            self.logger.debug(
+                "No match found in any of %d connections for item: %s",
+                len(self._full_connections),
+                item,
+            )
+        await self._send_item(item, config, *remote_pairs_for_broadcast)
+
+    async def _send_item(
+        self,
+        item: BaseEvent,
+        config: Optional[BroadcastConfig],
+        *remote_pairs: Tuple[Optional[str], RemoteEndpoint],
+    ) -> None:
+        if not item.is_bound:
+            item.bind(self)
         compressed_item = self._compress_event(item)
-        disconnected_endpoints = []
-        for name, remote in list(self._outbound_connections.items()):
-            # list() makes a copy, so changes to _outbount_connections don't cause errors
-            if remote.can_send_item(item, config):
-                try:
-                    await remote.send_message(Broadcast(compressed_item, config))
-                except RemoteDisconnected:
+        message = Broadcast(compressed_item, config)
+        for name, remote in remote_pairs:
+            try:
+                await remote.send_message(message)
+            except RemoteDisconnected as err:
+                if name is not None:
+                    self.logger.debug(
+                        f"Attempt to broadcast to '%s' failed: %s.", name, err
+                    )
+                    self._full_connections.pop(name, None)
+                else:
                     self.logger.debug(f"Remote endpoint {name} no longer exists")
-                    disconnected_endpoints.append(name)
-        for name in disconnected_endpoints:
-            self._outbound_connections.pop(name, None)
 
     def broadcast_nowait(
         self, item: BaseEvent, config: Optional[BroadcastConfig] = None
@@ -715,8 +738,7 @@ class AsyncioEndpoint(BaseEndpoint):
         should be broadcasted to. By default, requests are broadcasted across
         all connected endpoints with their consuming call sites.
         """
-        item._origin = self.name
-        item._id = str(uuid.uuid4())
+        item.bind(self, str(uuid.uuid4()))
 
         future: "asyncio.Future[TResponse]" = asyncio.Future()
         self._futures[item._id] = future  # type: ignore
