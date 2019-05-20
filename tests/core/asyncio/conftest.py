@@ -62,12 +62,6 @@ async def endpoint(event_loop):
         # the events we broadcast. Many tests use the same Endpoint for
         # broadcasting and receiving which is a valid use case so we hook it up
         await endpoint.connect_to_endpoints(ConnectionConfig.from_name(config.name))
-        import logging
-        import asyncio
-
-        expected_loop = asyncio.get_event_loop()
-        logging.info("LOOP IN FIXTURE: %s", id(expected_loop))
-        assert expected_loop == endpoint._loop
         yield endpoint
 
 
