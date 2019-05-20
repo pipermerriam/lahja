@@ -16,7 +16,7 @@ def config():
         yield ConnectionConfig(name, ipc_path)
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def server(config):
     # TODO< verify with test client.broadcast() -> server and server.broadcast() -> client works
     endpoint = AsyncioEndpoint()
@@ -28,7 +28,7 @@ async def server(config):
         yield endpoint
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def client(server, config):
     # TODO< verify with test client.broadcast() -> server and server.broadcast() -> client works
     endpoint = AsyncioEndpoint()

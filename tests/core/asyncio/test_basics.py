@@ -3,32 +3,44 @@ import pickle
 
 import pytest
 
-from helpers import DummyRequest, DummyRequestPair, DummyResponse
-from lahja import AsyncioEndpoint, BaseEvent, UnexpectedResponse
+from helpers import DummyRequest, DummyRequestPair
+from lahja import (
+    AsyncioEndpoint,
+    BaseEvent,
+    BaseRequestResponseEvent,
+    UnexpectedResponse,
+)
+
+
+class Response(BaseEvent):
+    def __init___(self, value):
+        self.value = value
+
+
+class Request(BaseRequestResponseEvent[Response]):
+    def __init__(self, value):
+        self.value = value
+
+    @staticmethod
+    def expected_response_type():
+        return Response
 
 
 @pytest.mark.asyncio
-async def test_request(endpoint, event_loop):
-    endpoint.subscribe(
-        DummyRequestPair,
-        lambda ev: endpoint.broadcast_nowait(
-            # Accessing `ev.property_of_dummy_request_pair` here allows us to validate
-            # mypy has the type information we think it has. We run mypy on the tests.
-            DummyResponse(ev.property_of_dummy_request_pair),
-            ev.broadcast_config(),
-        ),
-    )
+async def test_request(endpoint_pair):
+    requester, responder = endpoint_pair
 
-    await endpoint.wait_until_any_connection_subscribed_to(DummyRequestPair)
+    ready = asyncio.Event()
 
-    item = DummyRequestPair()
-    response = await endpoint.request(item)
-    # Accessing `response.property_of_dummy_response` here allows us to validate
-    # mypy has the type information we think it has. We run mypy on the tests.
-    print(response.property_of_dummy_response)
-    assert isinstance(response, DummyResponse)
-    # Ensure the registration was cleaned up
-    assert item._id not in endpoint._futures
+    def do_responder():
+        ready.set()
+        request = await responder.wait_for(Request)
+        await responder.broadcast(Response(request.value), request.response_config())
+
+    response = await requester.request(Request("test"))
+
+    assert isinstance(response, Response)
+    assert response.value == "test"
 
 
 @pytest.mark.asyncio
