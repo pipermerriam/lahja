@@ -829,4 +829,6 @@ class AsyncioEndpoint(BaseEndpoint):
                     break
         finally:
             self._queues[event_type].remove(casted_queue)
+            if not self._queues[event_type]:
+                self._queues.pop(event_type)
             await self._notify_subscriptions_changed()
