@@ -18,7 +18,7 @@ from typing import (  # noqa: F401
     cast,
 )
 
-from .misc import (
+from lahja.common import (
     BaseEvent,
     BaseRequestResponseEvent,
     BroadcastConfig,
