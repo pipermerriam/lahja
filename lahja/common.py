@@ -87,6 +87,21 @@ class BaseRequestResponseEvent(ABC, BaseEvent, Generic[TResponse]):
         pass
 
 
+class _MyNameIs(BaseEvent):
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _WhoAreYou(BaseRequestResponseEvent[_MyNameIs]):
+    __slots__ = ()
+
+    @staticmethod
+    def expected_response_type() -> Type[_MyNameIs]:
+        return _MyNameIs
+
+
 class SubscriptionsUpdated(NamedTuple):
     subscriptions: Set[Type[BaseEvent]]
     response_expected: bool

@@ -111,39 +111,68 @@ class Connection:
             raise RemoteDisconnected()
 
 
-class InboundConnection:
+class RemoteEndpoint:
     """
     A local Endpoint might have several ``InboundConnection``s, each of them represents a remote
     Endpoint which has connected to the given Endpoint and is attempting to send it messages.
     """
 
+    __slots__ = (
+        "name",
+        "conn",
+        "new_msg_func",
+        "subscribed_messages",
+        "_notify_lock",
+        "_received_ack",
+        "_received_subscription",
+    )
+    logger = logging.getLogger("lahja.endpoint.InboundConnection")
+
     def __init__(
-        self, conn: Connection, new_msg_func: Callable[[Broadcast], None]
+        self,
+        name: Optional[str],
+        conn: Connection,
+        new_msg_func: Callable[[Broadcast], Any],
     ) -> None:
+        self.name = name
         self.conn = conn
         self.new_msg_func = new_msg_func
 
-        self.logger = logging.getLogger("lahja.endpoint.InboundConnection")
-
         self._notify_lock = asyncio.Lock()
-        self._received_response = asyncio.Condition()
+
+        self._received_ack = asyncio.Condition()
+        self._received_subscription = asyncio.Condition()
+
+        self.subscribed_messages: Set[Type[BaseEvent]] = set()
 
     async def run(self) -> None:
         while True:
             try:
                 message = await self.conn.read_message()
             except RemoteDisconnected:
-                async with self._received_response:
-                    self._received_response.notify_all()
+                async with self._received_ack:
+                    self._received_ack.notify_all()
                 return
 
-            if isinstance(message, Broadcast):
-                self.new_msg_func(message)
-            elif isinstance(message, SubscriptionsAck):
-                async with self._received_response:
-                    self._received_response.notify_all()
+            message_type = type(message)
+
+            if message_type is Broadcast:
+                self.new_msg_func(message)  # type: ignore
+            elif message_type is SubscriptionsUpdated:
+                self.subscribed_messages = message.subscriptions  # type: ignore
+                async with self._received_subscription:
+                    self._received_subscription.notify_all()
+                if message.response_expected:  # type: ignore
+                    await self.send_message(SubscriptionsAck())
+            elif message_type is SubscriptionsAck:
+                async with self._received_ack:
+                    self._received_ack.notify_all()
             else:
-                self.logger.error(f"received unexpected message: {message}")
+                self.logger.error(
+                    f"Remote endpoint {self.name or self.conn} sent back an "
+                    f"unexpected message: {type(message)}"
+                )
+                return
 
     async def notify_subscriptions_updated(
         self, subscriptions: Set[Type[BaseEvent]], block: bool = True
@@ -157,7 +186,7 @@ class InboundConnection:
         async with self._notify_lock:
             # The lock ensures only one coroutine can notify this endpoint at any one time
             # and that no replies are accidentally received by the wrong coroutines.
-            async with self._received_response:
+            async with self._received_ack:
                 try:
                     await self.conn.send_message(
                         SubscriptionsUpdated(subscriptions, block)
@@ -165,56 +194,16 @@ class InboundConnection:
                 except RemoteDisconnected:
                     return
                 if block:
-                    await self._received_response.wait()
-
-
-class OutboundConnection:
-    """
-    The local Endpoint might have several ``OutboundConnection``s, each of them represents a
-    remote ``Endpoint`` which has been connected to. The remote endpoint occasionally sends
-    special message "backwards" to the local endpoint that connected to it.
-
-    Those messages (``SubscriptionsUpdated``) specify which kinds of messages the remote
-    Endpoint is subscribed to. No other message types are allowed to flow "backwards" from
-    an outbound connection and otherwise are dropped.
-    """
-
-    def __init__(self, name: str, conn: Connection) -> None:
-        self.conn = conn
-        self.name = name
-        self.subscribed_messages: Set[Type[BaseEvent]] = set()
-
-        self.logger = logging.getLogger("lahja.endpoint.OutboundConnection")
-        self._received_subscription = asyncio.Condition()
-
-    async def run(self) -> None:
-        while True:
-            try:
-                message = await self.conn.read_message()
-            except RemoteDisconnected:
-                return
-
-            if not isinstance(message, SubscriptionsUpdated):
-                self.logger.error(
-                    f"Endpoint {self.name} sent back an unexpected message: {type(message)}"
-                )
-                return
-
-            self.subscribed_messages = message.subscriptions
-            async with self._received_subscription:
-                self._received_subscription.notify_all()
-            if message.response_expected:
-                await self.send_message(SubscriptionsAck())
+                    await self._received_ack.wait()
 
     def can_send_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> bool:
-        is_response = config is not None and config.filter_event_id is not None
-        passes_config = config is None or config.allowed_to_receive(self.name)
-        passes_filter = type(item) in self.subscribed_messages
+        if config is not None:
+            if config.filter_event_id is not None:
+                return True
+            elif not config.allowed_to_receive(self.name):
+                return False
 
-        if not passes_config:
-            return False
-
-        return is_response or passes_filter
+        return type(item) in self.subscribed_messages
 
     async def send_message(self, message: Msg) -> None:
         await self.conn.send_message(message)
@@ -250,9 +239,11 @@ class AsyncioEndpoint(BaseEndpoint):
 
     _loop: Optional[asyncio.AbstractEventLoop]
 
-    def __init__(self) -> None:
-        self._outbound_connections: Dict[str, OutboundConnection] = {}
-        self._inbound_connections: Set[InboundConnection] = set()
+        # connections that we expect to both send and receive events.
+        self._full_connections: Dict[str, RemoteEndpoint] = {}
+        # connections that we will only receive events from.
+        self._half_connections: Set[RemoteEndpoint] = set()
+
         self._futures: Dict[Optional[str], "asyncio.Future[BaseEvent]"] = {}
         self._handler: Dict[Type[BaseEvent], List[Callable[[BaseEvent], Any]]] = {}
         self._queues: Dict[Type[BaseEvent], List["asyncio.Queue[BaseEvent]"]] = {}
@@ -348,13 +339,19 @@ class AsyncioEndpoint(BaseEndpoint):
 
     async def _accept_conn(self, reader: StreamReader, writer: StreamWriter) -> None:
         conn = Connection(reader, writer)
-        remote = InboundConnection(conn, self.receive_message)
-        self._inbound_connections.add(remote)
+        # We don't yet know the name of this remote so we use `None`.  If a
+        # successful reverse connection is established then the endpoint will
+        # be upgraded to a full connection and given a name.
+        remote = RemoteEndpoint(None, conn, self.receive_message)
+        self._half_connections.add(remote)
 
         task = asyncio.ensure_future(remote.run())
-        task.add_done_callback(lambda _: self._inbound_connections.remove(remote))
+        task.add_done_callback(lambda _: self._half_connections.discard(remote))
         task.add_done_callback(self._child_tasks.remove)
         self._child_tasks.add(task)
+
+        # attempt to establish a reverse connection
+        asyncio.ensure_future(self._establish_reverse_connection(remote))
 
         # the Endpoint on the other end blocks until it receives this message
         await remote.notify_subscriptions_updated(self.subscribed_events)
@@ -371,10 +368,17 @@ class AsyncioEndpoint(BaseEndpoint):
         Tell all inbound connections of our new subscriptions
         """
         # make a copy so that the set doesn't change while we iterate over it
-        for inbound_connection in self._inbound_connections.copy():
-            await inbound_connection.notify_subscriptions_updated(
-                self.subscribed_events
+        subscriptions = self.subscribed_events
+
+        await asyncio.gather(
+            *(
+                remote.notify_subscriptions_updated(subscriptions)
+                for remote in itertools.chain(
+                    self._half_connections.copy(),
+                    tuple(self._full_connections.values()),
+                )
             )
+        )
 
     async def wait_until_any_connection_subscribed_to(
         self, event: Type[BaseEvent]
@@ -382,16 +386,16 @@ class AsyncioEndpoint(BaseEndpoint):
         """
         Block until any other endpoint has subscribed to the ``event`` from this endpoint.
         """
-        if len(self._outbound_connections) == 0:
+        if len(self._full_connections) == 0:
             raise Exception("there are no outbound connections!")
 
-        for outbound in self._outbound_connections.values():
+        for outbound in self._full_connections.values():
             if event in outbound.subscribed_messages:
                 return
 
         coros = [
             outbound.wait_until_subscribed_to(event)
-            for outbound in self._outbound_connections.values()
+            for outbound in self._full_connections.values()
         ]
         _, pending = await asyncio.wait(coros, return_when=asyncio.FIRST_COMPLETED)
         (task.cancel() for task in pending)
@@ -403,12 +407,12 @@ class AsyncioEndpoint(BaseEndpoint):
         Block until all other endpoints that we are connected to are subscribed to the ``event``
         from this endpoint.
         """
-        if len(self._outbound_connections) == 0:
+        if len(self._full_connections) == 0:
             raise Exception("there are no outbound connections!")
 
         coros = [
             outbound.wait_until_subscribed_to(event)
-            for outbound in self._outbound_connections.values()
+            for outbound in self._full_connections.values()
         ]
         await asyncio.wait(coros, return_when=asyncio.ALL_COMPLETED)
 
@@ -436,7 +440,7 @@ class AsyncioEndpoint(BaseEndpoint):
                 raise ConnectionAttemptRejected(
                     f"Trying to connect to {config.name} twice. Names must be uniqe."
                 )
-            elif config.name in self._outbound_connections.keys():
+            elif config.name in self._full_connections.keys():
                 raise ConnectionAttemptRejected(
                     f"Already connected to {config.name} at {config.path}. Names must be unique."
                 )
@@ -446,19 +450,18 @@ class AsyncioEndpoint(BaseEndpoint):
     async def _connect_receiving_queue(self) -> None:
         self._receiving_loop_running.set()
         while self._running:
-            (item, config) = await self._receiving_queue.get()
+            try:
+                (item, config) = await self._receiving_queue.get()
+            except RuntimeError as err:
+                # compare error string since `RuntimeError` could potentially
+                # come from some other python API and we only want to catch the
+                # closed event loop case.
+                if str(err) == "Event loop is closed":
+                    break
+                raise
             try:
                 event = self._decompress_event(item)
-                self._process_item(event, config)
-            except Exception:
-                traceback.print_exc()
-
-    async def _connect_internal_queue(self) -> None:
-        self._internal_loop_running.set()
-        while self._running:
-            (item, config) = await self._internal_queue.get()
-            try:
-                self._process_item(item, config)
+                await self._process_item(event, config)
             except Exception:
                 traceback.print_exc()
 
@@ -488,7 +491,7 @@ class AsyncioEndpoint(BaseEndpoint):
         await self.connect_to_endpoint(endpoint)
 
     async def connect_to_endpoint(self, config: ConnectionConfig) -> None:
-        if config.name in self._outbound_connections.keys():
+        if config.name in self._full_connections.keys():
             self.logger.warning(
                 "Tried to connect to %s but we are already connected to that Endpoint",
                 config.name,
@@ -496,13 +499,11 @@ class AsyncioEndpoint(BaseEndpoint):
             return
 
         conn = await Connection.connect_to(str(config.path))
-        remote = OutboundConnection(config.name, conn)
-        self._outbound_connections[config.name] = remote
+        remote = RemoteEndpoint(config.name, conn, self.receive_message)
+        self._full_connections[config.name] = remote
 
         task = asyncio.ensure_future(remote.run())
-        task.add_done_callback(
-            lambda _: self._outbound_connections.pop(config.name, None)
-        )
+        task.add_done_callback(lambda _: self._full_connections.pop(config.name, None))
         task.add_done_callback(self._child_tasks.remove)
         self._child_tasks.add(task)
 
@@ -510,7 +511,7 @@ class AsyncioEndpoint(BaseEndpoint):
         await remote.wait_until_subscription_received()
 
     def is_connected_to(self, endpoint_name: str) -> bool:
-        return endpoint_name in self._outbound_connections
+        return endpoint_name in self._full_connections
 
     def _process_item(self, item: BaseEvent, config: Optional[BroadcastConfig]) -> None:
         if item is TRANSPARENT_EVENT:
@@ -531,6 +532,65 @@ class AsyncioEndpoint(BaseEndpoint):
         if event_type in self._handler:
             for handler in self._handler[event_type]:
                 handler(item)
+
+    async def _who_are_you_stream_handler(self) -> None:
+        """
+        Long running process that responds to _WhoAreYou events which are
+        typically send from server to client to establish a reverse connection.
+        """
+        self.logger.debug("Endpoint %s running _WhoAreYou mesage processor", self.name)
+        self._who_are_you_stream_handler_running.set()
+        async for request in self.stream(_WhoAreYou):
+            await self.broadcast(_MyNameIs(self.name), request.response_config())
+
+    async def _establish_reverse_connection(self, remote: RemoteEndpoint) -> None:
+        item = _WhoAreYou()
+        # We bind the event as if it was a request/response, giving it an _id
+        # which allows the remote to respond to us without needing to receive a
+        # subscription update.
+        item.bind(self, str(uuid.uuid4()))
+        await self._send_item(item, None, (None, remote))
+
+        # Listen for the client indentify itself by name
+        try:
+            response = await asyncio.wait_for(self.wait_for(_MyNameIs), timeout=2)
+        except TimeoutError:
+            self.logger.error(
+                (
+                    "Server for endpoint %s failed to establish revers connection "
+                    "with connecting client"
+                ),
+                self.name,
+            )
+        else:
+            self.logger.debug(
+                "Server for endpoint %s established reverse connection to client %s",
+                self.name,
+                response.name,
+            )
+            if response.name not in self._full_connections:
+                self._half_connections.remove(remote)
+                if remote.name is not None:
+                    raise Exception("TODO: already named")
+                remote.name = response.name
+                self._full_connections[response.name] = remote
+
+    async def start(self) -> None:
+        self._receiving_loop_running = asyncio.Event()
+        self._who_are_you_stream_handler_running = asyncio.Event()
+
+        self._receiving_queue = asyncio.Queue()
+
+        self._running = True
+
+        asyncio.ensure_future(self._connect_receiving_queue())
+        # This needs to go in the child_coros because it needs explicit
+        # cancellation since it uses `self.stream` instead of `while
+        # self._is_running` for the run loop.
+        self._child_tasks.add(asyncio.ensure_future(self._who_are_you_stream_handler()))
+
+        await self._receiving_loop_running.wait()
+        await self._who_are_you_stream_handler_running.wait()
 
     def stop(self) -> None:
         """

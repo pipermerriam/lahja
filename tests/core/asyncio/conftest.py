@@ -10,6 +10,50 @@ def generate_unique_name():
     return str(uuid.uuid4())
 
 
+@pytest.fixture
+def _client_server_unique_name():
+    return generate_unique_name()
+
+
+@pytest.fixture
+def server_config(ipc_base_path, _client_server_unique_name):
+    return ConnectionConfig.from_name(
+        f"server-{_client_server_unique_name}", base_path=ipc_base_path
+    )
+
+
+@pytest.fixture
+async def endpoint_server(server_config):
+    async with AsyncioEndpoint.serve(server_config) as server:
+        yield server
+
+
+@pytest.fixture
+async def endpoint_client(server_config, endpoint_server, _client_server_unique_name):
+    async with AsyncioEndpoint(f"client-{_client_server_unique_name}").run() as client:
+        await client.connect_to_endpoint(server_config)
+        await endpoint_server.wait_connected_to(client.name)
+        assert client.is_connected_to(endpoint_server.name)
+
+        yield client
+
+
+@pytest.fixture
+def client_server_pair(endpoint_client, endpoint_server):
+    return (endpoint_client, endpoint_server)
+
+
+@pytest.fixture(params=("client-server", "server-client"))
+def endpoint_pair(request, client_server_pair):
+    client, server = client_server_pair
+    if request.param == "client-server":
+        return (client, server)
+    elif request.param == "server-client":
+        return (server, client)
+    else:
+        raise Exception(f"Unrecognized parameter: {request.param}")
+
+
 @pytest.fixture(scope="function")
 async def endpoint(event_loop):
     config = ConnectionConfig.from_name(generate_unique_name())

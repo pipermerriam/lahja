@@ -48,13 +48,9 @@ parser.add_argument("--backend", action="append", help="The endpoint backend to 
 async def run(args: argparse.Namespace, backend: BaseBackend):
     consumer_endpoint_configs = create_consumer_endpoint_configs(args.num_processes)
 
-    (
-        config.path.unlink()
-        for config in consumer_endpoint_configs
-        + tuple(
-            ConnectionConfig.from_name(name)
-            for name in (ROOT_ENDPOINT, REPORTER_ENDPOINT, DRIVER_ENDPOINT)
-        )
+    (config.path.unlink() for config in consumer_endpoint_configs) + tuple(
+        ConnectionConfig.from_name(name)
+        for name in (ROOT_ENDPOINT, REPORTER_ENDPOINT, DRIVER_ENDPOINT)
     )
 
     root_config = ConnectionConfig.from_name(ROOT_ENDPOINT)
