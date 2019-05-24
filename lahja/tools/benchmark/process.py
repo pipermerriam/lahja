@@ -1,6 +1,8 @@
 import itertools
 import logging
 import multiprocessing
+import os
+import signal
 import time
 from typing import Any, AsyncGenerator, List, NamedTuple, Optional, Tuple  # noqa: F401
 
@@ -42,15 +44,26 @@ class DriverProcess:
 
     def stop(self) -> None:
         assert self._process is not None
-        self._process.terminate()
-        self._process.join(1)
+        if self._process.pid is not None:
+            os.kill(self._process.pid, signal.SIGINT)
+        else:
+            self._process.terminate()
+
+        try:
+            self._process.join(1)
+        except TimeoutError:
+            self._process.terminate()
+            self._process.join(1)
 
     @staticmethod
     def launch(config: DriverProcessConfig) -> None:
         # UNCOMMENT FOR DEBUGGING
         # logger = multiprocessing.log_to_stderr()
         # logger.setLevel(logging.INFO)
-        config.backend.run(DriverProcess.worker, config)
+        try:
+            config.backend.run(DriverProcess.worker, config)
+        except KeyboardInterrupt:
+            return
 
     @staticmethod
     async def worker(config: DriverProcessConfig) -> None:
@@ -95,7 +108,6 @@ class ConsumerProcess:
             await event_bus.connect_to_endpoints(
                 ConnectionConfig.from_name(REPORTER_ENDPOINT)
             )
-            await event_bus.wait_until_all_remotes_subscribed_to(TotalRecordedEvent)
 
             stats = LocalStatistic()
             events = event_bus.stream(PerfMeasureEvent, num_events=num_events)
@@ -104,6 +116,7 @@ class ConsumerProcess:
                     RawMeasureEntry(sent_at=event.sent_at, received_at=time.time())
                 )
 
+            await event_bus.wait_until_all_remotes_subscribed_to(TotalRecordedEvent)
             await event_bus.broadcast(
                 TotalRecordedEvent(stats.crunch(event_bus.name)),
                 BroadcastConfig(filter_endpoint=REPORTER_ENDPOINT),

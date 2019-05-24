@@ -122,12 +122,68 @@ class EndpointAPI(ABC):
         """
         ...
 
+    #
+    # Subscriptions API
+    #
     @abstractmethod
     def get_connected_endpoints_and_subscriptions(
         self
     ) -> Tuple[Tuple[Optional[str], Set[Type[BaseEvent]]], ...]:
         """
         Return all connected endpoints and their event type subscriptions to this endpoint.
+        """
+        ...
+
+    @abstractmethod
+    def is_remote_subscribed_to(
+        self, remote_endpoint: str, event_type: Type[BaseEvent]
+    ) -> bool:
+        """
+        Return ``True`` if the specified remote endpoint is subscribed to the specified event type
+        from this endpoint. Otherwise return ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def is_any_remote_subscribed_to(self, event_type: Type[BaseEvent]) -> bool:
+        """
+        Return ``True`` if at least one of the connected remote endpoints is subscribed to the
+        specified event type from this endpoint. Otherwise return ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def are_all_remotes_subscribed_to(self, event_type: Type[BaseEvent]) -> bool:
+        """
+        Return ``True`` if every connected remote endpoint is subscribed to the specified event
+        type from this endpoint. Otherwise return ``False``.
+        """
+        ...
+
+    @abstractmethod
+    async def wait_until_remote_subscribed_to(
+        self, remote_endpoint: str, event: Type[BaseEvent]
+    ) -> None:
+        """
+        Block until the specified remote endpoint has subscribed to the specified event type
+        from this endpoint.
+        """
+        ...
+
+    @abstractmethod
+    async def wait_until_any_remote_subscribed_to(self, event: Type[BaseEvent]) -> None:
+        """
+        Block until any other remote endpoint has subscribed to the specified event type
+        from this endpoint.
+        """
+        ...
+
+    async def wait_until_all_remotes_subscribed_to(
+        self, event: Type[BaseEvent]
+    ) -> None:
+        """
+        Block until all currently connected remote endpoints are subscribed to the specified
+        event type from this endpoint.
         """
         ...
 

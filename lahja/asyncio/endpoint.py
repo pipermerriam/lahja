@@ -161,6 +161,12 @@ class RemoteEndpoint:
         self._running = asyncio.Event()
         self._stopped = asyncio.Event()
 
+    def __str__(self) -> str:
+        return f"RemoteEndpoint[{self.name if self.name is not None else id(self)}]"
+
+    def __repr__(self) -> str:
+        return f"<{self}>"
+
     async def wait_started(self) -> None:
         await self._running.wait()
 
@@ -200,11 +206,11 @@ class RemoteEndpoint:
                 async with self._received_response:
                     self._received_response.notify_all()
             elif isinstance(message, SubscriptionsUpdated):
-                self.subscribed_messages = message.subscriptions
                 async with self._received_subscription:
+                    self.subscribed_messages = message.subscriptions
                     self._received_subscription.notify_all()
-                if message.response_expected:
-                    await self.send_message(SubscriptionsAck())
+                    if message.response_expected:
+                        await self.send_message(SubscriptionsAck())
             else:
                 self.logger.error(f"received unexpected message: {message}")
 
@@ -217,9 +223,13 @@ class RemoteEndpoint:
         endpoint has acknowledged the new subscription set. If ``block`` is ``False`` then this
         function will return immediately after the send finishes.
         """
+        # The extra lock ensures only one coroutine can notify this endpoint at any one time
+        # and that no replies are accidentally received by the wrong
+        # coroutines. Without this, in the case where `block=True`, this inner
+        # block would release the lock on the call to `wait()` which would
+        # allow the ack from a different update to incorrectly result in this
+        # returning before the ack had been received.
         async with self._notify_lock:
-            # The lock ensures only one coroutine can notify this endpoint at any one time
-            # and that no replies are accidentally received by the wrong coroutines.
             async with self._received_response:
                 try:
                     await self.conn.send_message(
@@ -276,6 +286,10 @@ class AsyncioEndpoint(BaseEndpoint):
     _receiving_queue: "asyncio.Queue[Tuple[Union[bytes, BaseEvent], Optional[BroadcastConfig]]]"
     _receiving_loop_running: asyncio.Event
 
+    _subscription_updates_running: asyncio.Event
+    _subscription_updates_condition: asyncio.Condition
+    _subscription_updates_queue: "asyncio.Queue[None]"
+
     _futures: Dict[Optional[str], "asyncio.Future[BaseEvent]"]
 
     _full_connections: Dict[str, RemoteEndpoint]
@@ -315,8 +329,17 @@ class AsyncioEndpoint(BaseEndpoint):
         # over an IPC socket.
         self._server_tasks: Set["asyncio.Future[Any]"] = set()
 
+        # way to signal that the connections to other endpoints have changed
+        self._connections_changed = asyncio.Condition()
+
         self._running = False
         self._serving = False
+
+    def __str__(self) -> str:
+        return f"Endpoint[{self.name}]"
+
+    def __repr__(self) -> str:
+        return f"<{self.name}>"
 
     @property
     def is_running(self) -> bool:
@@ -365,15 +388,69 @@ class AsyncioEndpoint(BaseEndpoint):
     async def start(self) -> None:
         if self.is_running:
             raise RuntimeError(f"Endpoint {self.name} is already running")
+
         self._receiving_loop_running = asyncio.Event()
         self._receiving_queue = asyncio.Queue()
+
+        self._subscription_updates_running = asyncio.Event()
+        self._subscription_updates_condition = asyncio.Condition()
+        self._subscription_updates_queue = asyncio.Queue()
 
         self._running = True
 
         self._endpoint_tasks.add(asyncio.ensure_future(self._connect_receiving_queue()))
+        self._endpoint_tasks.add(
+            asyncio.ensure_future(self._process_subscription_updates())
+        )
+        self._endpoint_tasks.add(
+            asyncio.ensure_future(self._process_subscription_updates_queue())
+        )
 
         await self._receiving_loop_running.wait()
+        await self._subscription_updates_running.wait()
+
         self.logger.debug("Endpoint[%s]: running", self.name)
+
+    async def _process_subscription_updates_queue(self) -> None:
+        while self.is_running:
+            await self._subscription_updates_queue.get()
+            async with self._subscription_updates_condition:
+                self._subscription_updates_condition.notify_all()
+
+    async def _process_subscription_updates(self) -> None:
+        self._subscription_updates_running.set()
+        async with self._subscription_updates_condition:
+            while self.is_running:
+                await self._subscription_updates_condition.wait()
+                subscribed_events = self.subscribed_events
+                await asyncio.gather(
+                    *(
+                        remote.notify_subscriptions_updated(subscribed_events)
+                        for remote in itertools.chain(
+                            self._half_connections.copy(), self._full_connections.values()
+                        )
+                    )
+                )
+
+    def _notify_subscriptions_changed_nowait(self) -> None:
+        self._subscription_updates_queue.put_nowait(None)
+
+    async def _connect_receiving_queue(self) -> None:
+        self._receiving_loop_running.set()
+        while self.is_running:
+            try:
+                (item, config) = await self._receiving_queue.get()
+            except RuntimeError as err:
+                # do explicit check since RuntimeError is a bit generic and we
+                # only want to catch the closed event loop case here.
+                if str(err) == "Event loop is closed":
+                    break
+                raise
+            try:
+                event = self._decompress_event(item)
+                await self._process_item(event, config)
+            except Exception:
+                traceback.print_exc()
 
     @check_event_loop
     async def start_server(self, ipc_path: Path) -> None:
@@ -399,21 +476,29 @@ class AsyncioEndpoint(BaseEndpoint):
     async def _accept_conn(self, reader: StreamReader, writer: StreamWriter) -> None:
         conn = Connection(reader, writer)
         remote = RemoteEndpoint(None, conn, self._receiving_queue.put)
-        self._half_connections.add(remote)
 
         task = asyncio.ensure_future(self._handle_client(remote))
         task.add_done_callback(self._server_tasks.remove)
+        task.add_done_callback(lambda _: self._half_connections.remove(remote))
         self._server_tasks.add(task)
 
-        # the Endpoint on the other end blocks until it receives this message
-        await remote.notify_subscriptions_updated(self.subscribed_events)
+        await remote.wait_started()
+
+        # we **must** ensure that the subscription updates are locked between
+        # the time that we manually update this individual connection and that
+        # we place it within the set of tracked connections, otherwise, a
+        # subscription update from elsewhere can occur between the time these
+        # two statements execute resulting in the remote missing a new
+        # subscription update.  Note that inverting these statements should
+        # also mitigate this, but it has the downside of the manual update
+        # potentially being redundant.
+        async with self._subscription_updates_condition:
+            await remote.notify_subscriptions_updated(self.subscribed_events)
+            await self._add_half_connection(remote)
 
     async def _handle_client(self, remote: RemoteEndpoint) -> None:
-        try:
-            async with run_remote_endpoint(remote):
-                await remote.wait_stopped()
-        finally:
-            self._half_connections.remove(remote)
+        async with run_remote_endpoint(remote):
+            await remote.wait_stopped()
 
     @property
     def subscribed_events(self) -> Set[Type[BaseEvent]]:
@@ -425,17 +510,6 @@ class AsyncioEndpoint(BaseEndpoint):
             .union(self._async_handler.keys())
             .union(self._queues.keys())
         )
-
-    async def _notify_subscriptions_changed(self) -> None:
-        """
-        Tell all inbound connections of our new subscriptions
-        """
-        # make a copy so that the set doesn't change while we iterate over it
-        subscribed_events = self.subscribed_events
-        for remote in self._half_connections.copy():
-            await remote.notify_subscriptions_updated(subscribed_events)
-        for remote in tuple(self._full_connections.values()):
-            await remote.notify_subscriptions_updated(subscribed_events)
 
     def get_connected_endpoints_and_subscriptions(
         self
@@ -479,23 +553,6 @@ class AsyncioEndpoint(BaseEndpoint):
             else:
                 seen.add(config.name)
 
-    async def _connect_receiving_queue(self) -> None:
-        self._receiving_loop_running.set()
-        while self.is_running:
-            try:
-                (item, config) = await self._receiving_queue.get()
-            except RuntimeError as err:
-                # do explicit check since RuntimeError is a bit generic and we
-                # only want to catch the closed event loop case here.
-                if str(err) == "Event loop is closed":
-                    break
-                raise
-            try:
-                event = self._decompress_event(item)
-                await self._process_item(event, config)
-            except Exception:
-                traceback.print_exc()
-
     @check_event_loop
     async def connect_to_endpoints(self, *endpoints: ConnectionConfig) -> None:
         """
@@ -532,30 +589,47 @@ class AsyncioEndpoint(BaseEndpoint):
 
         conn = await Connection.connect_to(config.path)
         remote = RemoteEndpoint(config.name, conn, self._receiving_queue.put)
-        self._full_connections[config.name] = remote
 
         task = asyncio.ensure_future(self._handle_server(remote))
+        # start a background task to watch for subscription changes and relay
+        # them to the core *wait* APIS for monitoring which endpoints we are
+        # connected to as well as their subscriptions.
         subscriptions_task = asyncio.ensure_future(
             self.watch_outbound_subscriptions(remote)
         )
+        # upon completion this task should remove itself from the set of
+        # tracked tasks.
         subscriptions_task.add_done_callback(self._endpoint_tasks.remove)
         self._endpoint_tasks.add(subscriptions_task)
 
+        # remove the tasks from the set of tracked tasks.
         task.add_done_callback(self._endpoint_tasks.remove)
+        # at the point where this task is done, so should the
+        # `subscriptions_task` since we no longer need to watch for changes to
+        # this remote's subscriptions
         task.add_done_callback(lambda _: subscriptions_task.cancel())
-
+        # finally this remote can be removed from the set of tracked
+        # connections.
+        task.add_done_callback(lambda _: self._full_connections.pop(config.name, None))
         self._endpoint_tasks.add(task)
 
-        # don't return control until the caller can safely call broadcast()
-        await remote.wait_until_subscription_received()
+        await remote.wait_started()
+
+        # we **must** ensure that the subscription updates are locked between
+        # the time that we manually update this individual connection and that
+        # we place it within the set of tracked connections, otherwise, a
+        # subscription update from elsewhere can occur between the time these
+        # two statements execute resulting in the remote missing a new
+        # subscription update.  Note that inverting these statements should
+        # also mitigate this, but it has the downside of the manual update
+        # potentially being redundant.
+        async with self._subscription_updates_condition:
+            await remote.notify_subscriptions_updated(self.subscribed_events)
+            await self._add_full_connection(remote)
 
     async def _handle_server(self, remote: RemoteEndpoint) -> None:
-        try:
-            async with run_remote_endpoint(remote):
-                await remote.wait_stopped()
-        finally:
-            if remote.name is not None:
-                self._full_connections.pop(remote.name)
+        async with run_remote_endpoint(remote):
+            await remote.wait_stopped()
 
     async def watch_outbound_subscriptions(self, outbound: RemoteEndpoint) -> None:
         while outbound in self._full_connections.values():
@@ -566,6 +640,30 @@ class AsyncioEndpoint(BaseEndpoint):
 
     def is_connected_to(self, endpoint_name: str) -> bool:
         return endpoint_name in self._full_connections
+
+    async def wait_until_connected_to(self, endpoint_name: str) -> None:
+        if self.is_connected_to(endpoint_name):
+            return
+
+        async with self._connections_changed:
+            while True:
+                await self._connections_changed.wait()
+                if self.is_connected_to(endpoint_name):
+                    return
+
+    async def _add_full_connection(self, remote: RemoteEndpoint) -> None:
+        if remote.name is None:
+            raise Exception("TODO: remote is not named")
+        async with self._connections_changed:
+            self._full_connections[remote.name] = remote
+            self._connections_changed.notify_all()
+
+    async def _add_half_connection(self, remote: RemoteEndpoint) -> None:
+        if remote.name is not None:
+            raise Exception("TODO: remote is named and should be a full connection")
+        async with self._connections_changed:
+            self._half_connections.add(remote)
+            self._connections_changed.notify_all()
 
     async def _process_item(
         self, item: BaseEvent, config: Optional[BroadcastConfig]
@@ -749,7 +847,7 @@ class AsyncioEndpoint(BaseEndpoint):
         # the user `await subscription.remove()`. This means this Endpoint will keep
         # getting events for a little while after it stops listening for them but
         # that's a performance problem, not a correctness problem.
-        asyncio.ensure_future(self._notify_subscriptions_changed())
+        self._notify_subscriptions_changed_nowait()
 
     def _remove_sync_subscription(
         self, event_type: Type[BaseEvent], handler_fn: SubscriptionSyncHandler
@@ -761,7 +859,7 @@ class AsyncioEndpoint(BaseEndpoint):
         # the user `await subscription.remove()`. This means this Endpoint will keep
         # getting events for a little while after it stops listening for them but
         # that's a performance problem, not a correctness problem.
-        asyncio.ensure_future(self._notify_subscriptions_changed())
+        self._notify_subscriptions_changed_nowait()
 
     async def subscribe(
         self,
@@ -786,7 +884,8 @@ class AsyncioEndpoint(BaseEndpoint):
                 self._remove_sync_subscription, event_type, casted_handler
             )
 
-        await self._notify_subscriptions_changed()
+        async with self._subscription_updates_condition:
+            self._subscription_updates_condition.notify_all()
 
         return Subscription(unsubscribe_fn)
 
@@ -805,7 +904,9 @@ class AsyncioEndpoint(BaseEndpoint):
             self._queues[event_type] = []
 
         self._queues[event_type].append(casted_queue)
-        await self._notify_subscriptions_changed()
+
+        async with self._subscription_updates_condition:
+            self._subscription_updates_condition.notify_all()
 
         if num_events is None:
             # loop forever
@@ -825,4 +926,6 @@ class AsyncioEndpoint(BaseEndpoint):
             self._queues[event_type].remove(casted_queue)
             if not self._queues[event_type]:
                 del self._queues[event_type]
-            await self._notify_subscriptions_changed()
+            # use nowait here since removing a subscription is not time
+            # sensitive and not blocking here is better performance.
+            self._notify_subscriptions_changed_nowait()
