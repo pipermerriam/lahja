@@ -293,8 +293,7 @@ class AsyncioEndpoint(BaseEndpoint):
 
     _futures: Dict[RequestID, "asyncio.Future[BaseEvent]"]
 
-    _full_connections: Dict[str, RemoteEndpoint]
-    _half_connections: Set[RemoteEndpoint]
+    _connections: Set[RemoteEndpoint]
 
     _async_handler: DefaultDict[Type[BaseEvent], List[SubscriptionAsyncHandler]]
     _sync_handler: DefaultDict[Type[BaseEvent], List[SubscriptionSyncHandler]]
@@ -321,8 +320,7 @@ class AsyncioEndpoint(BaseEndpoint):
 
         # storage containers for inbound and outbound connections to other
         # endpoints
-        self._full_connections = {}
-        self._half_connections = set()
+        self._connections = set()
 
         # storage for futures which are waiting for a response.
         self._futures: Dict[RequestID, "asyncio.Future[BaseEvent]"] = {}
@@ -447,9 +445,7 @@ class AsyncioEndpoint(BaseEndpoint):
                 await asyncio.gather(
                     *(
                         remote.notify_subscriptions_updated(subscribed_events)
-                        for remote in itertools.chain(
-                            self._half_connections.copy(), self._full_connections.values()
-                        )
+                        for remote in self._connections
                     )
                 )
 
@@ -500,7 +496,7 @@ class AsyncioEndpoint(BaseEndpoint):
 
         task = asyncio.ensure_future(self._handle_client(remote))
         task.add_done_callback(self._server_tasks.remove)
-        task.add_done_callback(lambda _: self._half_connections.remove(remote))
+        task.add_done_callback(lambda _: self._connections.remove(remote))
         self._server_tasks.add(task)
 
         await remote.wait_started()
@@ -515,7 +511,7 @@ class AsyncioEndpoint(BaseEndpoint):
         # potentially being redundant.
         async with self._subscription_updates_condition:
             await remote.notify_subscriptions_updated(self.subscribed_events)
-            await self._add_half_connection(remote)
+            await self._add_connection(remote)
 
     async def _handle_client(self, remote: RemoteEndpoint) -> None:
         async with run_remote_endpoint(remote):
@@ -567,7 +563,7 @@ class AsyncioEndpoint(BaseEndpoint):
                 raise ConnectionAttemptRejected(
                     f"Trying to connect to {config.name} twice. Names must be uniqe."
                 )
-            elif config.name in self._full_connections.keys():
+            elif self.is_connected_to(config.name):
                 raise ConnectionAttemptRejected(
                     f"Already connected to {config.name} at {config.path}. Names must be unique."
                 )
@@ -601,12 +597,6 @@ class AsyncioEndpoint(BaseEndpoint):
 
     async def connect_to_endpoint(self, config: ConnectionConfig) -> None:
         self._throw_if_already_connected(config)
-        if config.name in self._full_connections.keys():
-            self.logger.warning(
-                "Tried to connect to %s but we are already connected to that Endpoint",
-                config.name,
-            )
-            return
 
         conn = await Connection.connect_to(config.path)
         remote = RemoteEndpoint(config.name, conn, self._receiving_queue.put)
@@ -631,7 +621,7 @@ class AsyncioEndpoint(BaseEndpoint):
         task.add_done_callback(lambda _: subscriptions_task.cancel())
         # finally this remote can be removed from the set of tracked
         # connections.
-        task.add_done_callback(lambda _: self._full_connections.pop(config.name, None))
+        task.add_done_callback(lambda _: self._connections.remove(remote))
         self._endpoint_tasks.add(task)
 
         await remote.wait_started()
@@ -646,7 +636,7 @@ class AsyncioEndpoint(BaseEndpoint):
         # potentially being redundant.
         async with self._subscription_updates_condition:
             await remote.notify_subscriptions_updated(self.subscribed_events)
-            await self._add_full_connection(remote)
+            await self._add_connection(remote)
 
     async def _handle_server(self, remote: RemoteEndpoint) -> None:
         async with run_remote_endpoint(remote):
@@ -660,7 +650,7 @@ class AsyncioEndpoint(BaseEndpoint):
             )
 
     def is_connected_to(self, endpoint_name: str) -> bool:
-        return endpoint_name in self._full_connections
+        return any(endpoint_name == remote.name for remote in self._connections)
 
     async def wait_until_connected_to(self, endpoint_name: str) -> None:
         if self.is_connected_to(endpoint_name):
@@ -672,18 +662,16 @@ class AsyncioEndpoint(BaseEndpoint):
                 if self.is_connected_to(endpoint_name):
                     return
 
-    async def _add_full_connection(self, remote: RemoteEndpoint) -> None:
-        if remote.name is None:
-            raise Exception("TODO: remote is not named")
-        async with self._connections_changed:
-            self._full_connections[remote.name] = remote
-            self._connections_changed.notify_all()
+    async def _add_connection(self, remote: RemoteEndpoint) -> None:
+        if remote in self._connections:
+            raise Exception("TODO: remote is already tracked")
+        elif remote.name is not None and self.is_connected_to(remote.name):
+            raise Exception(
+                f"TODO: already connected to remote with name {remote.name}"
+            )
 
-    async def _add_half_connection(self, remote: RemoteEndpoint) -> None:
-        if remote.name is not None:
-            raise Exception("TODO: remote is named and should be a full connection")
         async with self._connections_changed:
-            self._half_connections.add(remote)
+            self._connections.add(remote)
             self._connections_changed.notify_all()
 
     async def _process_item(
