@@ -893,7 +893,7 @@ class AsyncioEndpoint(BaseEndpoint):
         A handler is passed as a second argument an :class:`~lahja.common.Subscription` is returned
         to unsubscribe from the event if needed.
         """
-        if inspect.iscoroutine(handler):
+        if inspect.iscoroutinefunction(handler):
             casted_handler = cast(SubscriptionAsyncHandler, handler)
             self._async_handler[event_type].append(casted_handler)
             unsubscribe_fn = functools.partial(
