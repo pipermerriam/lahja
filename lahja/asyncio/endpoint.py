@@ -418,6 +418,7 @@ class AsyncioEndpoint(BaseEndpoint):
 
         self._running = True
 
+        # background tasks
         self._endpoint_tasks.add(asyncio.ensure_future(self._connect_receiving_queue()))
         self._endpoint_tasks.add(
             asyncio.ensure_future(self._process_subscription_updates())
@@ -828,7 +829,7 @@ class AsyncioEndpoint(BaseEndpoint):
         should be broadcasted to. By default, requests are broadcasted across
         all connected endpoints with their consuming call sites.
         """
-        request_id = str(uuid.uuid4())
+        request_id = self._get_request_id()
 
         future: "asyncio.Future[TResponse]" = asyncio.Future()
         self._futures[request_id] = future  # type: ignore
