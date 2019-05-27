@@ -52,6 +52,8 @@ from lahja.common import (
     Subscription,
     SubscriptionsAck,
     SubscriptionsUpdated,
+    _MyNameIs,
+    _WhoAreYou,
 )
 from lahja.exceptions import (
     ConnectionAttemptRejected,
@@ -425,6 +427,10 @@ class AsyncioEndpoint(BaseEndpoint):
             asyncio.ensure_future(self._process_subscription_updates_queue())
         )
 
+        # handle requests from servers sending the _WhoAreYou internal message,
+        # responding with a _MyNameIs response.
+        await self.subscribe(_WhoAreYou, self._handle_who_are_you)
+
         await self._receiving_loop_running.wait()
         await self._subscription_updates_running.wait()
 
@@ -451,6 +457,13 @@ class AsyncioEndpoint(BaseEndpoint):
 
     def _notify_subscriptions_changed_nowait(self) -> None:
         self._subscription_updates_queue.put_nowait(None)
+
+    async def _handle_who_are_you(self, req: _WhoAreYou) -> None:
+        """
+        Handle incoming requests from connected endpoints for the name of this
+        endpoint.
+        """
+        await self.broadcast(_MyNameIs(self.name), req.broadcast_config())
 
     async def _connect_receiving_queue(self) -> None:
         self._receiving_loop_running.set()
@@ -513,9 +526,35 @@ class AsyncioEndpoint(BaseEndpoint):
             await remote.notify_subscriptions_updated(self.subscribed_events)
             await self._add_connection(remote)
 
+        self._server_tasks.add(
+            asyncio.ensure_future(self._establish_reverse_connection(remote))
+        )
+
     async def _handle_client(self, remote: RemoteEndpoint) -> None:
         async with run_remote_endpoint(remote):
             await remote.wait_stopped()
+
+    async def _establish_reverse_connection(self, remote: RemoteEndpoint) -> None:
+        try:
+            response = await asyncio.wait_for(
+                self._request(_WhoAreYou(), None, (remote,)), timeout=2
+            )
+        except asyncio.TimeoutError:
+            self.logger.debug(
+                "%s: failed to establish reverse connection to %s", self, remote
+            )
+        else:
+            self.logger.debug(
+                "%s: establish reverse connection to %s", self, response.name
+            )
+            # NOTE: this is a very *implicit* mechanism for upgrading a
+            # connection.  As things currently stand, simply setting the name
+            # results in all of the mechanisms that filter by name
+            # automatically picking up on this as a named endpoint and applying
+            # the appropriate filters.
+            async with self._connections_changed:
+                remote.name = response.name
+                self._connections_changed.notify_all()
 
     @property
     def subscribed_events(self) -> Set[Type[BaseEvent]]:
@@ -756,10 +795,14 @@ class AsyncioEndpoint(BaseEndpoint):
         where this event should be broadcasted to. By default, events are broadcasted across
         all connected endpoints with their consuming call sites.
         """
-        await self._broadcast(item, config, None)
+        await self._broadcast(item, config, None, None)
 
     async def _broadcast(
-        self, item: BaseEvent, config: Optional[BroadcastConfig], id: Optional[str]
+        self,
+        item: BaseEvent,
+        config: Optional[BroadcastConfig],
+        id: Optional[RequestID],
+        remotes_for_broadcast: Optional[Tuple[RemoteEndpoint, ...]],
     ) -> None:
         item.bind(self, id)
 
@@ -770,18 +813,37 @@ class AsyncioEndpoint(BaseEndpoint):
             return
 
         # Broadcast to every connected Endpoint that is allowed to receive the event
+        if remotes_for_broadcast is None:
+            await self._send_to_remotes(
+                item, config, *self._get_remotes_for_broadcast(item, config)
+            )
+        else:
+            await self._send_to_remotes(item, config, *remotes_for_broadcast)
+
+    def _get_remotes_for_broadcast(
+        self, item: BaseEvent, config: Optional[BroadcastConfig]
+    ) -> Tuple[RemoteEndpoint, ...]:
+        return tuple(
+            remote for remote in self._connections if remote.can_send_item(item, config)
+        )
+
+    async def _send_to_remotes(
+        self,
+        item: BaseEvent,
+        config: Optional[BroadcastConfig],
+        *remotes: RemoteEndpoint,
+    ) -> None:
+        if not item.is_bound:
+            raise Exception("TODO: item must be bound")
         compressed_item = self._compress_event(item)
-        disconnected_endpoints = []
-        for name, remote in list(self._full_connections.items()):
-            # list() makes a copy, so changes to _outbount_connections don't cause errors
-            if remote.can_send_item(item, config):
-                try:
-                    await remote.send_message(Broadcast(compressed_item, config))
-                except RemoteDisconnected:
-                    self.logger.debug(f"Remote endpoint {name} no longer exists")
-                    disconnected_endpoints.append(name)
-        for name in disconnected_endpoints:
-            self._full_connections.pop(name, None)
+
+        message = Broadcast(compressed_item, config)
+        for remote in remotes:
+            try:
+                await remote.send_message(message)
+            except RemoteDisconnected:
+                self.logger.debug(f"Remote endpoint {remote} no longer exists")
+                self._connections.remove(remote)
 
     def broadcast_nowait(
         self, item: BaseEvent, config: Optional[BroadcastConfig] = None
@@ -800,7 +862,7 @@ class AsyncioEndpoint(BaseEndpoint):
         accepting new messages this function will continue to accept them, which in the
         worst case could lead to runaway memory usage.
         """
-        asyncio.ensure_future(self._broadcast(item, config, None))
+        asyncio.ensure_future(self._broadcast(item, config, None, None))
 
     @check_event_loop
     async def request(
@@ -817,6 +879,14 @@ class AsyncioEndpoint(BaseEndpoint):
         should be broadcasted to. By default, requests are broadcasted across
         all connected endpoints with their consuming call sites.
         """
+        return await self._request(item, config, None)
+
+    async def _request(
+        self,
+        item: BaseRequestResponseEvent[TResponse],
+        config: Optional[BroadcastConfig],
+        remotes_for_broadcast: Optional[Tuple[RemoteEndpoint, ...]],
+    ) -> TResponse:
         request_id = self._get_request_id()
 
         future: "asyncio.Future[TResponse]" = asyncio.Future()
@@ -824,7 +894,8 @@ class AsyncioEndpoint(BaseEndpoint):
         # mypy can't reconcile the TResponse with the declared type of
         # `self._futures`.
 
-        await self._broadcast(item, config, request_id)
+        self.logger.info("SENDING TO: %s", remotes_for_broadcast)
+        await self._broadcast(item, config, request_id, remotes_for_broadcast)
 
         future.add_done_callback(
             functools.partial(self._remove_cancelled_future, request_id)

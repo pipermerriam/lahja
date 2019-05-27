@@ -18,8 +18,8 @@ def _get_remote(endpoint, name):
 
 
 @pytest.mark.asyncio
-async def test_asyncio_stream_api_updates_subscriptions(pair_of_endpoints):
-    subscriber, other = pair_of_endpoints
+async def test_asyncio_stream_api_updates_subscriptions(endpoint_pair):
+    subscriber, other = endpoint_pair
     remote = _get_remote(other, subscriber.name)
 
     assert StreamEvent not in remote.subscribed_messages
@@ -57,8 +57,8 @@ async def test_asyncio_stream_api_updates_subscriptions(pair_of_endpoints):
 
 
 @pytest.mark.asyncio
-async def test_asyncio_wait_for_updates_subscriptions(pair_of_endpoints):
-    subscriber, other = pair_of_endpoints
+async def test_asyncio_wait_for_updates_subscriptions(endpoint_pair):
+    subscriber, other = endpoint_pair
     remote = _get_remote(other, subscriber.name)
 
     assert StreamEvent not in remote.subscribed_messages
@@ -92,8 +92,8 @@ class InheretedStreamEvent(StreamEvent):
 
 
 @pytest.mark.asyncio
-async def test_asyncio_subscription_api_does_not_match_inherited_classes(pair_of_endpoints):
-    subscriber, other = pair_of_endpoints
+async def test_asyncio_subscription_api_does_not_match_inherited_classes(endpoint_pair):
+    subscriber, other = endpoint_pair
     remote = _get_remote(other, subscriber.name)
 
     assert StreamEvent not in remote.subscribed_messages
@@ -125,8 +125,8 @@ class SubscribeEvent(BaseEvent):
 
 
 @pytest.mark.asyncio
-async def test_asyncio_subscribe_updates_subscriptions(pair_of_endpoints):
-    subscriber, other = pair_of_endpoints
+async def test_asyncio_subscribe_updates_subscriptions(endpoint_pair):
+    subscriber, other = endpoint_pair
     remote = _get_remote(other, subscriber.name)
 
     assert SubscribeEvent not in remote.subscribed_messages

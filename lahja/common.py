@@ -148,3 +148,14 @@ Message.register(SubscriptionsAck)
 
 # mypy doesn't appreciate the ABCMeta trick
 Msg = Union[Broadcast, SubscriptionsUpdated, SubscriptionsAck]
+
+
+class _MyNameIs(BaseEvent):
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _WhoAreYou(BaseRequestResponseEvent[_MyNameIs]):
+    @staticmethod
+    def expected_response_type() -> Type[_MyNameIs]:
+        return _MyNameIs
