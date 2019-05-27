@@ -14,6 +14,7 @@ from typing import (  # noqa: F401
 )
 
 from lahja.exceptions import BindError
+from lahja.typing import RequestID
 
 if TYPE_CHECKING:
     from lahja.base import EndpointAPI  # noqa: F401
@@ -31,7 +32,7 @@ class BroadcastConfig:
     def __init__(
         self,
         filter_endpoint: Optional[str] = None,
-        filter_event_id: Optional[str] = None,
+        filter_event_id: Optional[RequestID] = None,
         internal: bool = False,
     ) -> None:
 
@@ -58,11 +59,11 @@ class BroadcastConfig:
 class BaseEvent:
 
     _origin = ""
-    _id: Optional[str] = None
+    _id: Optional[RequestID] = None
 
     is_bound = False
 
-    def bind(self, endpoint: "EndpointAPI", id: Optional[str]) -> None:
+    def bind(self, endpoint: "EndpointAPI", id: Optional[RequestID]) -> None:
         if self.is_bound:
             raise BindError("Event is already bound")
         self._origin = endpoint.name

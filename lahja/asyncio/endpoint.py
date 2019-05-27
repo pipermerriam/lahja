@@ -2,6 +2,7 @@ import asyncio
 from asyncio import StreamReader, StreamWriter
 from collections import defaultdict
 import functools
+import hashlib
 import inspect
 import itertools
 import logging
@@ -28,7 +29,6 @@ from typing import (  # noqa: F401
     Union,
     cast,
 )
-import uuid
 
 from async_generator import asynccontextmanager
 
@@ -58,6 +58,7 @@ from lahja.exceptions import (
     RemoteDisconnected,
     UnexpectedResponse,
 )
+from lahja.typing import RequestID
 
 
 async def wait_for_path(path: Path, timeout: int = 2) -> None:
@@ -290,7 +291,7 @@ class AsyncioEndpoint(BaseEndpoint):
     _subscription_updates_condition: asyncio.Condition
     _subscription_updates_queue: "asyncio.Queue[None]"
 
-    _futures: Dict[Optional[str], "asyncio.Future[BaseEvent]"]
+    _futures: Dict[RequestID, "asyncio.Future[BaseEvent]"]
 
     _full_connections: Dict[str, RemoteEndpoint]
     _half_connections: Set[RemoteEndpoint]
@@ -303,13 +304,28 @@ class AsyncioEndpoint(BaseEndpoint):
     def __init__(self, name: str) -> None:
         self.name = name
 
+        # normalize the request ID prefix to 6 bytes which combined with the
+        # request_id counter gives a 1/16million chance of collision
+        # TODO: this should be profiled with larger values to determine the performance overhead
+        try:
+            _name_digest = hashlib.sha256(self.name.encode("ascii")).digest()
+        except UnicodeDecodeError:
+            raise Exception(
+                f"TODO: Invalid endpoint name: '{name}'. Must be ASCII encodable string"
+            )
+        self._request_id_base = _name_digest[:6]
+        _counter_start = int.from_bytes(_name_digest[6:8], "little")
+        # the counter starts somewhere in the 65536 range for additional base
+        # randomness
+        self._request_id_counter = itertools.count(_counter_start)
+
         # storage containers for inbound and outbound connections to other
         # endpoints
         self._full_connections = {}
         self._half_connections = set()
 
         # storage for futures which are waiting for a response.
-        self._futures: Dict[Optional[str], "asyncio.Future[BaseEvent]"] = {}
+        self._futures: Dict[RequestID, "asyncio.Future[BaseEvent]"] = {}
 
         # handlers for event subscriptions.  These are
         # intentionally stored separately so that the cost of
@@ -334,6 +350,10 @@ class AsyncioEndpoint(BaseEndpoint):
 
         self._running = False
         self._serving = False
+
+    def _get_request_id(self) -> RequestID:
+        request_id = next(self._request_id_counter) % 65536
+        return cast(RequestID, self._request_id_base + request_id.to_bytes(2, "little"))
 
     def __str__(self) -> str:
         return f"Endpoint[{self.name}]"
@@ -831,7 +851,9 @@ class AsyncioEndpoint(BaseEndpoint):
 
         return result
 
-    def _remove_cancelled_future(self, id: str, future: "asyncio.Future[Any]") -> None:
+    def _remove_cancelled_future(
+        self, id: RequestID, future: "asyncio.Future[Any]"
+    ) -> None:
         try:
             future.exception()
         except asyncio.CancelledError:
