@@ -192,7 +192,8 @@ class AsyncioEndpoint(BaseEndpoint):
     _subscriptions_changed: asyncio.Event
 
     def __init__(self, name: str) -> None:
-        self.name = name
+        super().__init__(name)
+
         try:
             self._get_request_id = RequestIDGenerator(name.encode("ascii") + b":")
         except UnicodeDecodeError:
@@ -200,15 +201,14 @@ class AsyncioEndpoint(BaseEndpoint):
                 f"TODO: Invalid endpoint name: '{name}'. Must be ASCII encodable string"
             )
 
+        # Signal when local broadcast gets enabled.
+        self._local_bradcast_enabled = asyncio.Event()  # type: ignore
+
         # Signal when a new remote connection is established
         self._remote_connections_changed = asyncio.Condition()  # type: ignore
 
         # Signal when at least one remote has had a subscription change.
         self._remote_subscriptions_changed = asyncio.Condition()  # type: ignore
-
-        # storage containers for inbound and outbound connections to other
-        # endpoints
-        self._connections = set()
 
         # event for signaling local subscriptions have changed.
         self._subscriptions_changed = asyncio.Event()
@@ -300,6 +300,10 @@ class AsyncioEndpoint(BaseEndpoint):
             asyncio.ensure_future(self._monitor_subscription_changes())
         )
 
+        monitor_task = asyncio.ensure_future(self._monitor_local_broadcast_changes())
+        monitor_task.add_done_callback(self._endpoint_tasks.remove)
+        self._endpoint_tasks.add(monitor_task)
+
         await self._receiving_loop_running.wait()
         self.logger.debug("Endpoint[%s]: running", self.name)
 
@@ -368,6 +372,13 @@ class AsyncioEndpoint(BaseEndpoint):
                         for remote in self._connections
                     )
                 )
+
+    async def _monitor_local_broadcast_changes(self) -> None:
+        await self._local_bradcast_enabled.wait()
+        async with self._remote_connections_changed:
+            self._remote_connections_changed.notify_all()
+        async with self._remote_subscriptions_changed:
+            self._remote_subscriptions_changed.notify_all()
 
     def _compress_event(self, event: BaseEvent) -> Union[BaseEvent, bytes]:
         if self.has_snappy_support:
@@ -617,12 +628,15 @@ class AsyncioEndpoint(BaseEndpoint):
     ) -> None:
         item.bind(self, id)
 
-        if should_endpoint_receive_item(
+        is_internal = config is not None and config.internal
+        is_eligible = should_endpoint_receive_item(
             item, config, self.name, self.get_subscribed_events()
-        ):
+        )
+
+        if is_eligible and (is_internal or self.is_local_broadcast_enabled):
             await self._process_item(item, config)
 
-        if config is not None and config.internal:
+        if is_internal:
             # if the event is flagged as internal we exit early since it should
             # not be broadcast beyond this endpoint
             return

@@ -305,11 +305,6 @@ class EndpointAPI(ABC):
 
     name: str
 
-    _remote_connections_changed: ConditionAPI
-    _remote_subscriptions_changed: ConditionAPI
-
-    _connections: Set[RemoteEndpointAPI]
-
     @property
     @abstractmethod
     def is_running(self) -> bool:
@@ -392,6 +387,20 @@ class EndpointAPI(ABC):
     async def wait_until_connections_change(self) -> None:
         """
         Block until the set of connected remote endpoints changes.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def is_local_broadcast_enabled(self) -> bool:
+        ...
+
+    @abstractmethod
+    def enable_local_broadcast(self) -> None:
+        """
+        When enabled, this endpoint will treat itself as one of it's connected
+        remote endpoints when dealing with event broadcasting and
+        subscriptions.
         """
         ...
 
@@ -540,13 +549,31 @@ class EndpointAPI(ABC):
         """
         ...
 
+    @abstractmethod
+    def get_subscribed_events(self) -> Set[Type[BaseEvent]]:
+        ...
+
 
 class BaseEndpoint(EndpointAPI):
     """
     Base class for endpoint implementations that implements shared/common logic
     """
 
+    _local_bradcast_enabled: EventAPI
+
+    _remote_connections_changed: ConditionAPI
+    _remote_subscriptions_changed: ConditionAPI
+
+    _connections: Set[RemoteEndpointAPI]
+
     logger = logging.getLogger("lahja.endpoint.Endpoint")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+        # storage containers for inbound and outbound connections to other
+        # endpoints
+        self._connections = set()
 
     def __str__(self) -> str:
         return f"Endpoint[{self.name}]"
@@ -572,6 +599,8 @@ class BaseEndpoint(EndpointAPI):
             await self.connect_to_endpoint(config)
 
     def is_connected_to(self, endpoint_name: str) -> bool:
+        if self.is_local_broadcast_enabled and endpoint_name == self.name:
+            return True
         return any(endpoint_name == remote.name for remote in self._connections)
 
     async def wait_until_connected_to(self, endpoint_name: str) -> None:
@@ -590,10 +619,14 @@ class BaseEndpoint(EndpointAPI):
         """
         Return all connected endpoints and their event type subscriptions to this endpoint.
         """
-        return tuple(
+        remote_endpoint_data = tuple(
             (remote.name, remote.get_subscribed_events())
             for remote in self._connections
         )
+        if self.is_local_broadcast_enabled:
+            return ((self.name, self.get_subscribed_events()),) + remote_endpoint_data
+        else:
+            return remote_endpoint_data
 
     async def wait_until_connections_change(self) -> None:
         """
@@ -601,6 +634,13 @@ class BaseEndpoint(EndpointAPI):
         """
         async with self._remote_connections_changed:
             await self._remote_connections_changed.wait()
+
+    @property
+    def is_local_broadcast_enabled(self) -> bool:
+        return self._local_bradcast_enabled.is_set()
+
+    def enable_local_broadcast(self) -> None:
+        self._local_bradcast_enabled.set()
 
     #
     # Event API

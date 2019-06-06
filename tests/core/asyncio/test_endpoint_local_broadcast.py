@@ -11,6 +11,8 @@ class BroadcastEvent(BaseEvent):
 
 @pytest.mark.asyncio
 async def test_subscribe_and_broadcast_to_self(endpoint):
+    endpoint.enable_local_broadcast()
+
     got_event = asyncio.Event()
 
     endpoint.subscribe(BroadcastEvent, lambda ev: got_event.set())
@@ -24,6 +26,8 @@ async def test_subscribe_and_broadcast_to_self(endpoint):
 
 @pytest.mark.asyncio
 async def test_wait_for_and_broadcast_to_self(endpoint):
+    endpoint.enable_local_broadcast()
+
     ready = asyncio.Event()
     got_event = asyncio.Event()
 
@@ -44,6 +48,8 @@ async def test_wait_for_and_broadcast_to_self(endpoint):
 
 @pytest.mark.asyncio
 async def test_stream_and_broadcast_to_self(endpoint):
+    endpoint.enable_local_broadcast()
+
     ready = asyncio.Event()
     finished_stream = asyncio.Event()
 
@@ -82,6 +88,8 @@ class Request(BaseRequestResponseEvent[Response]):
 
 @pytest.mark.asyncio
 async def test_request_response_and_broadcast_to_self(endpoint):
+    endpoint.enable_local_broadcast()
+
     ready = asyncio.Event()
 
     async def do_response():
