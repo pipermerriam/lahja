@@ -58,6 +58,8 @@ from lahja.exceptions import (
 )
 from lahja.typing import ConditionAPI, RequestID
 
+from .future import Future
+
 
 class TrioConnection(ConnectionAPI):
     logger = logging.getLogger("lahja.trio.Connection")
@@ -516,7 +518,8 @@ class TrioEndpoint(BaseEndpoint):
         self._message_processing_loop_running.set()
         async for (item, config) in receive_channel:
             event = self._decompress_event(item)
-            nursery.start_soon(self._process_item, event, config)
+            await self._process_item(event, config)
+            #nursery.start_soon(self._process_item, event, config)
 
     async def _monitor_subscription_changes(self) -> None:
         while not self.is_stopped:
@@ -535,11 +538,12 @@ class TrioEndpoint(BaseEndpoint):
             async with trio.open_nursery() as nursery:
                 async with self._remote_connections_changed:
                     for remote in self._connections:
-                        nursery.start_soon(
-                            remote.notify_subscriptions_updated,
-                            subscribed_events,
-                            False,
-                        )
+                        await remote.notify_subscriptions_updated(subscribed_events, False)
+                        #nursery.start_soon(
+                        #    remote.notify_subscriptions_updated,
+                        #    subscribed_events,
+                        #    False,
+                        #)
             async with self._remote_subscriptions_changed:
                 self._remote_subscriptions_changed.notify_all()
 
@@ -550,8 +554,8 @@ class TrioEndpoint(BaseEndpoint):
 
         # handle request/response
         if config is not None and config.filter_event_id in self._pending_requests:
-            send_channel = self._pending_requests.pop(config.filter_event_id)
-            await send_channel.send(item)
+            fut = self._pending_requests.pop(config.filter_event_id)
+            fut.set_result(item)
 
         # handle stream channel
         if event_type in self._stream_channels:
@@ -677,9 +681,8 @@ class TrioEndpoint(BaseEndpoint):
         """
         Connect to the given endpoints and await until all connections are established.
         """
-        async with trio.open_nursery() as nursery:
-            for config in endpoints:
-                nursery.start_soon(self.connect_to_endpoint, config)
+        for config in endpoints:
+            await self.connect_to_endpoint(config)
 
     async def connect_to_endpoint(self, config: ConnectionConfig) -> None:
         """
@@ -791,18 +794,15 @@ class TrioEndpoint(BaseEndpoint):
         request_id = next(self._get_request_id)
 
         # Create an asynchronous generator that we use to pipe the result
-        send_channel, receive_channel = cast(
-            RequestResponseChannelPair, trio.open_memory_channel(0)
-        )
+        fut = Future()
 
         # place the send channel where the message processing loop can find it.
-        self._pending_requests[request_id] = send_channel
+        self._pending_requests[request_id] = fut
 
         await self._broadcast(item, config, request_id)
 
         # await for the result to be sent through the channel.
-        result = await receive_channel.receive()
-        await send_channel.aclose()
+        result = await fut
         expected_response_type = item.expected_response_type()
         if not isinstance(result, expected_response_type):
             raise UnexpectedResponse(

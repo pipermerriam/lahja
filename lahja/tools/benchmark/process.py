@@ -3,6 +3,7 @@ import itertools
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 import signal
 import time
 from typing import Any, AsyncGenerator, List, NamedTuple, Optional, Tuple  # noqa: F401
@@ -26,6 +27,7 @@ from lahja.tools.benchmark.typing import (
     TotalRecordedEvent,
 )
 from lahja.tools.benchmark.utils.reporting import print_full_report
+from lahja.tools.profiling import profiler
 
 
 class DriverProcessConfig(NamedTuple):
@@ -70,7 +72,8 @@ class BaseDriverProcess(ABC):
             setup_stderr_lahja_logging()
 
         try:
-            config.backend.run(cls.worker, config)
+            with profiler(Path('/home/piper/projects/lahja/tmp/prof/driver')):
+                config.backend.run(cls.worker, config)
         except KeyboardInterrupt:
             return
 
@@ -149,7 +152,8 @@ class BaseConsumerProcess(ABC):
         if config.debug_logging:
             setup_stderr_lahja_logging()
 
-        config.backend.run(cls.worker, name, config)
+        with profiler(Path('/home/piper/projects/lahja/tmp/prof') / name):
+            config.backend.run(cls.worker, name, config)
 
     @classmethod
     async def worker(cls, name: str, config: ConsumerConfig) -> None:
